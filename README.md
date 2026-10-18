@@ -1,6 +1,19 @@
+<p align="center">
+  <a href="https://reactiot.com.au">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="docs/assets/reactiot-logo-dark.svg">
+      <img src="docs/assets/reactiot-logo.svg" alt="React IoT" width="320">
+    </picture>
+  </a>
+</p>
+
 # GX5s Logger
 
 Documentation and bench tools for the **GX5s Logger Development Board** (board version `v2106200`), an ESP32-S based IoT/vehicle logger.
+
+<p align="center">
+  <img src="docs/assets/gx5s-device.jpg" alt="GX5s Logger in its enclosure" width="400">
+</p>
 
 ## Board at a glance
 
