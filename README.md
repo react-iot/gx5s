@@ -12,7 +12,7 @@
 Documentation and bench tools for the **GX5s Logger Development Board** (board version `v2106200`), an ESP32-S based IoT/vehicle logger.
 
 <p align="center">
-  <img src="docs/assets/gx5s-device.jpg" alt="GX5s Logger in its enclosure" width="400">
+  <img src="docs/assets/gx5s-device.png" alt="GX5s Logger in its enclosure" width="400">
 </p>
 
 ## Board at a glance
