@@ -31,7 +31,7 @@ Documentation and bench tools for the **GX5s Logger Development Board** (board v
 |---|---|
 | [`docs/gx5s-board-spec.md`](docs/gx5s-board-spec.md) | Full board specification: interfaces, pinouts, buses, open items |
 | [`docs/components/`](docs/components/) | Per-component notes (ESP32 module, flash, RTC, IMU, GPIO expander, modem, USB) |
-| [`docs/references/`](docs/references/) | Schematic PDF and component datasheets |
+| [`docs/references/`](docs/references/) | Component datasheets |
 | [`tools/`](tools/) | Bench tools, e.g. [`esp32_mac_monitor.py`](tools/README.md) for reading board MACs |
 
 ## Quick start: read a board's MAC

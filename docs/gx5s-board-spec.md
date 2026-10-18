@@ -4,7 +4,7 @@
 **Board Version:** `v2106200`  
 **Schematic date:** 2021-06-20  
 
-Reference PDFs: [schematic and component datasheets](references/README.md)
+Reference PDFs: [component datasheets](references/README.md)
 
 ---
 
