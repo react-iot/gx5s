@@ -1,0 +1,46 @@
+menu "GX5s modem and MQTT"
+
+    menu "Bootstrap (provisioning) broker"
+        comment "Anonymous, client id = MAC. Used until the backend provisions the real broker"
+        config GX5_MQTT_HOST
+            string "Bootstrap broker host (name or IP)"
+            default ""
+        config GX5_MQTT_PORT
+            int "Broker port"
+            default 8883
+        config GX5_MQTT_TLS
+            bool "Bootstrap broker uses TLS (handled by the modem)"
+            default y
+    endmenu
+
+    config GX5_MQTT_TOPIC_PREFIX
+        string "Topic prefix: <prefix>/<device-id>/{status,telemetry,cmd}"
+        default "gx5s"
+    config GX5_MQTT_KEEPALIVE_S
+        int "Keepalive (s)"
+        default 120
+    config GX5_MQTT_TLS_SECLEVEL
+        int "TLS seclevel, all brokers: 0 none (INSECURE), 1 verify server, 2 mutual"
+        range 0 2
+        default 1
+    config GX5_MQTT_TLS_CACERT
+        string "CA cert file on the modem filesystem (upload with AT+QFUPL)"
+        default "cacert.pem"
+
+    config GX5_PROVISION_AFTER_FAILS
+        int "Fall back to the bootstrap broker after this many failed connects"
+        default 5
+        range 1 200
+        help
+            Counts consecutive failures to reach the provisioned broker while the
+            cellular network is up. After one bootstrap attempt the provisioned
+            broker gets another round.
+
+    config GX5_APN
+        string "Cellular APN (empty = keep the modem's stored APN)"
+        default ""
+
+    config GX5_GNSS
+        bool "Read the modem's GNSS fix (lat/lon/kmh) for telemetry, live and offline"
+        default y
+endmenu

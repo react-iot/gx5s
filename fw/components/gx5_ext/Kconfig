@@ -1,0 +1,17 @@
+menu "GX5s external UART (harness SAT-TX / SAT-RX)"
+    config GX5_EXT_UART
+        bool "Enable the external UART"
+        default y
+    config GX5_EXT_BAUD
+        int "Baud rate"
+        depends on GX5_EXT_UART
+        default 9600
+    config GX5_EXT_TX_GPIO
+        int "ESP32 TX pin (SAT-TX)"
+        depends on GX5_EXT_UART
+        default 19
+    config GX5_EXT_RX_GPIO
+        int "ESP32 RX pin (SAT-RX)"
+        depends on GX5_EXT_UART
+        default 21
+endmenu

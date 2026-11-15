@@ -1,0 +1,72 @@
+menu "GX5s application"
+
+    config GX5_MANUFACTURER
+        string "Manufacturer (startup banner)"
+        default "React IoT"
+    config GX5_PRODUCT_NAME
+        string "Product name (startup banner)"
+        default "GX5s Logger"
+    config GX5_PRODUCT_ID
+        string "Hardware id (startup banner)"
+        default "GX5s-v210620"
+
+    menu "Supply protection"
+        config GX5_VCC_CUTOFF_MV
+            int "Enter PROTECT below this supply voltage (mV)"
+            default 11800
+            help
+                12 V lead-acid at rest: 12.0 V is ~50 %, 11.8 V ~30 %.
+                Use ~23600 for 24 V systems.
+        config GX5_VCC_HYST_MV
+            int "Leave PROTECT only above cutoff + this (mV)"
+            default 400
+        config GX5_VCC_ABSENT_MV
+            int "Below this there is no harness supply (USB/LiPo): no protection (mV)"
+            default 6000
+            help
+                USB bench power reads ~4.4 V here, so this must sit above that.
+                A 12 V battery below this is not protected.
+        config GX5_BAT_MIN_MV
+            int "Keep the harness feed on while asleep when the LiPo is below (mV)"
+            default 3500
+            help
+                Asleep (SLEEP and PROTECT) the board runs from its LiPo and
+                draws nothing from the vehicle. Below this (or with no LiPo
+                fitted, which reads 0) the harness feed stays on (~7 mA) so the
+                board keeps running; the LiPo is recharged when next awake
+                with a healthy supply.
+        config GX5_VCC_VBE_MV
+            int "VCC sense calibration: Q4 base-emitter voltage (mV)"
+            default 605
+            help
+                The supply is sensed through a divider loaded by transistor Q4,
+                so the reading depends on its Vbe. Measure the supply with a
+                meter: for every 21 mV the firmware reads high, raise this by
+                1 mV. 605 was measured on one board at room temperature.
+                Vbe falls about 2 mV per degC, so expect the reading to move
+                roughly -40 mV per degC (not compensated).
+        config GX5_PROTECT_RECHECK_S
+            int "Re-measure the supply every (s) while in PROTECT"
+            default 1800
+    endmenu
+
+    menu "Timing"
+        config GX5_HEARTBEAT_S
+            int "Ignition off: wake and report every (s)"
+            default 3600
+        config GX5_TELEMETRY_S
+            int "Ignition on: publish telemetry every (s)"
+            default 60
+        config GX5_LINGER_S
+            int "Ignition off: stay connected this long before sleeping (s)"
+            default 30
+        config GX5_CONNECT_TIMEOUT_S
+            int "Ignition off: give up connecting and sleep after (s)"
+            default 180
+    endmenu
+
+    config GX5_LIGHT_SLEEP
+        bool "Automatic light sleep while awake (needs modem RI wired to GSM-INT)"
+        default y
+
+endmenu

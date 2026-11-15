@@ -1,0 +1,3 @@
+#include "gx5.h"
+
+ESP_EVENT_DEFINE_BASE(GX5_EVENT);
