@@ -68,16 +68,19 @@ Components do not call each other; only `main` wires them together.
 | Topic | Direction | Payload |
 |---|---|---|
 | `discovery/<mac>` (`<mac>` = device id `AA:BB:CC:DD:EE:FF`, factory MAC + 3) | device → bootstrap broker | `{"id":"<mac>","fw":"<ver>","reason":"unprovisioned"}` (or `broker-unreachable`) |
-| `<prefix>/<mac>/status` | device → broker, retained | `online`, `provisioning`, `sleep`, `protect`, `offline` (last will) |
-| `<prefix>/<mac>/event` | device → broker | `{"id","fw","reason":"broker-changed"}` or `broker-change-failed`; driving events `{"ts":…,"ev":"brake","mg":520}` (`accel`, `brake`, `left`, `right`, `harsh`) |
-| `<prefix>/<mac>/telemetry` | device → broker | `{"ts":1794745845,"ign":1,"vcc_mv":12850,"bat_mv":4100,"ext":1,"chg":0,"can":1532,"wake":"timer","up_s":42,"acc":[12,-30,1004],"temp":31.5,"gyro":[0.4,-1.2,0.1],"lat":-33.86785,"lon":151.20732,"kmh":48.6,"cog":113.48,"sat":9}` |
-| `<prefix>/<mac>/can` | device → broker | changed CAN values: `{"ts":…,"obd":["7E8 01 0C 1AF8"]}` or `{"ts":…,"j1939":["FEEE 00 8C7DFFFFFFFFFFFF"]}` |
-| `<prefix>/<mac>/ext` | device → broker | each line received on the external UART (harness SAT pins) |
-| `<prefix>/<mac>/cmd` | broker → device, QoS 1 | `{"provision":{"pop":"14720943","broker":{"host":"…","port":8883,"user":"…","pass":"…","tls":true},"config":{"can":{"mode":"obd2","bitrate":500000}}}}` provisions; anything else is answered with telemetry |
+| `device/<mac>/<loc>/status/connected` | device → broker, retained | `online`, `provisioning`, `sleep`, `protect`, `offline` (last will) |
+| `device/<mac>/<loc>/event` | device → broker | `{"id","fw","reason":"broker-changed"}` or `broker-change-failed`; driving events `{"ts":…,"ev":"brake","mg":520}` (`accel`, `brake`, `left`, `right`, `harsh`) |
+| `device/<mac>/<loc>/telemetry` | device → broker | `{"ts":1794745845,"ign":1,"vcc_mv":12850,"bat_mv":4100,"ext":1,"chg":0,"can":1532,"wake":"timer","up_s":42,"acc":[12,-30,1004],"temp":31.5,"gyro":[0.4,-1.2,0.1],"lat":-33.86785,"lon":151.20732,"kmh":48.6,"cog":113.48,"sat":9}` |
+| `device/<mac>/<loc>/can` | device → broker | changed CAN values: `{"ts":…,"obd":["7E8 01 0C 1AF8"]}` or `{"ts":…,"j1939":["FEEE 00 8C7DFFFFFFFFFFFF"]}` |
+| `device/<mac>/<loc>/ext` | device → broker | each line received on the external UART (harness SAT pins) |
+| `device/<mac>` and `location/<loc>` | broker → device, QoS 1 | `{"provision":{"pop":"14720943","broker":{"host":"…","port":8883,"user":"…","pass":"…","tls":true},"config":{"location":"0001","can":{"mode":"obd2","bitrate":500000}}}}` provisions; anything else is answered with telemetry |
+
+`<loc>` is the location id: `0000` until provisioning sets `config.location` (1-9 of
+`A-Z a-z 0-9 _ -`). A command sent to `location/<loc>` reaches every device at that location.
 
 Provisioning: a new device connects to the bootstrap broker anonymously (no username or
 password, client id = device id) and announces itself on
-`discovery/<mac>`. Publish the provisioning message to its `cmd` topic. `pop` is the device's
+`discovery/<mac>`. Publish the provisioning message to `device/<mac>`. `pop` is the device's
 PIN: the last three bytes of its id as one decimal number, 8 digits (`C4:DD:57:E0:9F:AF` →
 `14720943`), also shown in the startup banner. With the right PIN the device applies `config`,
 tries the new broker immediately and stores it only if it connects; with a wrong one it changes
@@ -85,7 +88,7 @@ nothing and publishes `provision-rejected`. The same message on the production b
 device again. After `GX5_PROVISION_AFTER_FAILS` failed connects it checks
 back with the bootstrap broker. `idf.py erase-flash` returns a device to unprovisioned.
 
-CAN is configured over the `cmd` topic and kept across reboots:
+CAN is configured over the command topic and kept across reboots:
 
 ```json
 {"can":{"mode":"obd2","bitrate":500000}}

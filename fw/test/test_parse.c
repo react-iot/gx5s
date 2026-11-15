@@ -22,10 +22,10 @@ int main(void)
     assert(gx5_last_int("+QMTOPEN: 0,3") == 3);
     assert(gx5_last_int("+QMTSTAT") == -1);
 
-    char a[] = "+QMTRECV: 0,7,\"gx5s/abc/cmd\",\"{\"x\":\"y\"}\"";
+    char a[] = "+QMTRECV: 0,7,\"device/abc\",\"{\"x\":\"y\"}\"";
     char *t, *p;
     assert(gx5_parse_qmtrecv(a, &t, &p));
-    assert(!strcmp(t, "gx5s/abc/cmd") && !strcmp(p, "{\"x\":\"y\"}"));
+    assert(!strcmp(t, "device/abc") && !strcmp(p, "{\"x\":\"y\"}"));
     char b[] = "+QMTRECV: 0,7,\"topic\"";
     assert(!gx5_parse_qmtrecv(b, &t, &p));
     char c[] = "+QMTRECV: 0,7";
@@ -74,6 +74,9 @@ int main(void)
     assert(!gx5_provision("{\"provision\":{\"pop\":42,\"broker\":{\"host\":\"h\"}}}", pop, &isp) && isp);   // PIN must be a string
     assert(!gx5_provision("{\"provision\":{\"broker\":{\"host\":\"h\"}}}", pop, &isp) && isp);            // no PIN
     assert(!gx5_provision("{\"broker\":{\"host\":\"h\"}}", pop, &isp) && !isp);                              // not a provisioning message
+
+    assert(gx5_id_ok("0000") && gx5_id_ok("a05") && gx5_id_ok("Depot_1-N"));
+    assert(!gx5_id_ok("") && !gx5_id_ok("0123456789") && !gx5_id_ok("a/b") && !gx5_id_ok("a+") && !gx5_id_ok("a\"b") && !gx5_id_ok("a b"));
 
     char fix[128];
     assert(gx5_fix_json("+QGPSLOC: 061951.0,-33.86785,151.20732,0.7,62.2,2,113.48,48.6,26.2,151126,09", fix, sizeof fix));

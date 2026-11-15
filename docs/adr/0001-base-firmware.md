@@ -60,14 +60,21 @@ Status: accepted (2026-11-15)
      no credential ships in the firmware. Credentials arrive with the broker message.
    - No stored broker: connect to bootstrap, publish `discovery/<id>`
      (`{"id","fw","reason":"unprovisioned"}`), status `provisioning`.
-   - Backend answers on `<prefix>/<id>/cmd` with one provisioning message:
-     `{"provision":{"pop":"<PIN>","broker":{"host","port","user","pass","tls"},"config":{"can":{..}}}}`.
+   - Topics: the device publishes under `device/<id>/<location>/` (`status/connected`,
+     `telemetry`, `event`, `can`, `ext`) and takes commands on `device/<id>` and
+     `location/<location>` (all devices at a location). The location id is `0000`
+     until provisioning sets `config.location` (1-9 of `A-Z a-z 0-9 _ -`, NVS
+     `gx5/loc`); a change reconnects so the last will and subscription follow. The
+     retained status under the old location is not cleared. There is no site id in
+     the topics: provisioning decides which broker a device belongs to.
+   - Backend answers on `device/<id>` with one provisioning message:
+     `{"provision":{"pop":"<PIN>","broker":{"host","port","user","pass","tls"},"config":{"location":"0001","can":{..}}}}`.
      `pop` is a proof-of-possession PIN in the style of ESP BLE provisioning: the last
      three bytes of the device id as one decimal number, 8 digits
      (`C4:DD:57:E0:9F:AF` -> `14720943`); it is also printed in the startup banner.
      A wrong or missing PIN, or a bare `{"broker":..}`, changes nothing and publishes
-     `event` `provision-rejected`. `config` is applied first (today: the `can`
-     object), then the broker is tried at once and stored **only if the connection
+     `event` `provision-rejected`. `config` is applied first (today: `location` and
+     the `can` object), then the broker is tried at once and stored **only if the connection
      succeeds**; otherwise the device returns to the broker it came from and
      publishes `event` `broker-change-failed`. Messages may be up to 511 bytes.
    - The same message on the production broker re-provisions.
@@ -82,9 +89,9 @@ Status: accepted (2026-11-15)
      unprovisioned. The count lives in NVS and only real power-on resets add to it
      (not deep-sleep wakes, crashes, watchdogs or brownouts).
    - Trust: authorisation is enforced by the broker, not the firmware. Broker
-     permission controls restrict publishing to a device's `cmd` topic to the
+     permission controls restrict publishing to a device's command topics to the
      permitted controller; other users on the account cannot send commands. The
-     firmware therefore acts on any `cmd` message it receives (no message signing),
+     firmware therefore acts on any command message it receives (no message signing),
      and TLS (seclevel >= 1) authenticates the broker.
 9. **Peripherals** (`gx5_io`, `gx5_store`, GNSS in `gx5_modem`). Each is optional at build time (menuconfig) and at
    runtime: a device that does not answer is logged once and skipped.
@@ -129,7 +136,7 @@ Status: accepted (2026-11-15)
     - J1939: address claim as 0xF8 (at start and on request), TP.BAM and TP RTS/CTS
       assembly with end-of-message ACK, optional "requested PGNs only" filter.
     - Latest value per (ECU, service, PID) or (PGN, source); only changes are
-      published, to `<prefix>/<id>/can`, as text
+      published, to `device/<id>/<location>/can`, as text
       (`7E8 01 0C 1AF8`, `FEEE 00 8C7D..`) inside a JSON array. Limits: 40 values,
       96 bytes each (longer responses truncated), 4 concurrent multi-frame messages.
     - Deliberately left out: CAN-based ignition detection (BMW, Toyota, Kia, Ford,
@@ -190,13 +197,13 @@ Status: accepted (2026-11-15)
       reported as `harsh`.
     - Events (`accel`, `brake`, `left`, `right`, `harsh`) must last 0.3 s and exceed
       `GX5_HARSH_ACCEL_MG` / `_BRAKE_MG` / `_TURN_MG` (300 / 400 / 400). They are logged
-      and published to `<prefix>/<id>/event` as `{"ts","ev","mg"}`; not queued offline.
+      and published to `device/<id>/<location>/event` as `{"ts","ev","mg"}`; not queued offline.
     - Host-tested with a simulated drive (`fw/test/test_motion.c`). On the bench only
       calibration and "no false events at rest" are checked: nothing has been driven.
 
 14. **External UART** (`gx5_ext`, harness SAT-TX GPIO19 / SAT-RX GPIO21, 9600 baud by
     default). Line based and device-agnostic: every received line is logged and
-    published to `<prefix>/<id>/ext`; the command `{"ext":"text"}` sends a line. The
+    published to `device/<id>/<location>/ext`; the command `{"ext":"text"}` sends a line. The
     line `gx5 ping` is answered with `gx5 pong <id>` so wiring can be checked without a
     broker. Bench 2026-11-15: works both ways against the Pi hat's serial header, but
     only with TX and RX swapped (`GX5_EXT_TX_GPIO=21`, `GX5_EXT_RX_GPIO=19`): the hat's

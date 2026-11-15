@@ -94,6 +94,14 @@ static inline bool gx5_json_str(const char *js, const char *key, char *out, size
     return true;
 }
 
+// A location id goes into MQTT topics and AT commands: 1..9 of [A-Za-z0-9_-].
+#define GX5_LOC_LEN 10
+static inline bool gx5_id_ok(const char *s)
+{
+    size_t n = strspn(s, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-");
+    return n && n < GX5_LOC_LEN && !s[n];
+}
+
 // Provisioning PIN (proof of possession): the last three bytes of the device id as
 // one decimal number, 8 digits. C4:DD:57:E0:9F:AF -> 0xE09FAF -> "14720943".
 static inline void gx5_pop(const uint8_t id[6], char out[9])

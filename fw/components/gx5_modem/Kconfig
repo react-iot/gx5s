@@ -13,9 +13,6 @@ menu "GX5s modem and MQTT"
             default y
     endmenu
 
-    config GX5_MQTT_TOPIC_PREFIX
-        string "Topic prefix: <prefix>/<device-id>/{status,telemetry,cmd}"
-        default "gx5s"
     config GX5_MQTT_KEEPALIVE_S
         int "Keepalive (s)"
         default 120

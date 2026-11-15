@@ -28,7 +28,7 @@ static const char *TAG = "modem";
 typedef struct {
     enum { M_PUB, M_RI, M_STOP, M_RECONNECT } type;
     bool retain;
-    char topic[96];
+    char topic[96]; // queued M_PUB: subtopic only; the modem task adds device/<id>/<location>/
     char data[GX5_PUB_MAX];
 } msg_t;
 
@@ -55,6 +55,26 @@ static gx5_broker_t s_stored, s_cand;
 static volatile bool s_have_cand;
 static bool s_have_stored, s_provisioning, s_session; // s_session: MQTT was opened since the last park
 static RTC_DATA_ATTR uint8_t s_fails;
+
+// Location id: topics are device/<id>/<location>/..., commands arrive on device/<id>
+// and location/<location>. Only the modem task reads s_loc; a change comes through NVS.
+static char s_loc[GX5_LOC_LEN] = "0000";
+static volatile bool s_loc_dirty = true;
+
+static void load_loc(void)
+{
+    nvs_handle_t h;
+    size_t len = sizeof s_loc;
+    s_loc_dirty = false;
+    if (nvs_open("gx5", NVS_READONLY, &h) != ESP_OK) return;
+    if (nvs_get_str(h, "loc", s_loc, &len) != ESP_OK || !gx5_id_ok(s_loc)) strcpy(s_loc, "0000");
+    nvs_close(h);
+}
+
+static void full_topic(char *out, size_t size, const char *sub)
+{
+    snprintf(out, size, "device/%s/%s/%s", s_id, s_loc, sub);
+}
 
 static void urc(char *line)
 {
@@ -195,7 +215,7 @@ static bool mqtt_connect(const gx5_broker_t *b)
     AT("AT+QMTCFG=\"pdpcid\",0,1");
     AT("AT+QMTCFG=\"keepalive\",0," STR(CONFIG_GX5_MQTT_KEEPALIVE_S));
     AT("AT+QMTCFG=\"session\",0,0"); // persistent: broker queues QoS1 cmds while we sleep
-    snprintf(cmd, sizeof cmd, "AT+QMTCFG=\"will\",0,1,1,1,\"%s/%s/status\",\"offline\"", CONFIG_GX5_MQTT_TOPIC_PREFIX, s_id);
+    snprintf(cmd, sizeof cmd, "AT+QMTCFG=\"will\",0,1,1,1,\"device/%s/%s/status/connected\",\"offline\"", s_id, s_loc);
     AT(cmd);
     if (b->tls) {
         AT("AT+QSSLCFG=\"seclevel\",0," STR(CONFIG_GX5_MQTT_TLS_SECLEVEL));
@@ -219,8 +239,11 @@ static bool mqtt_connect(const gx5_broker_t *b)
         ESP_LOGE(TAG, "broker rejected connect: %s", line);
         return false;
     }
-    snprintf(cmd, sizeof cmd, "AT+QMTSUB=0,1,\"%s/%s/cmd\",1", CONFIG_GX5_MQTT_TOPIC_PREFIX, s_id);
+    // Commands: device/<id> (this device) and location/<location> (every device there).
     // +QMTSUB: <client>,<msgid>,<result>,<value>
+    snprintf(cmd, sizeof cmd, "AT+QMTSUB=0,1,\"device/%s\",1", s_id);
+    if (!at(cmd, "+QMTSUB:", line, NULL, 15000) || sscanf(line, "+QMTSUB: %*d,%*d,%d", &result) != 1 || result) return false;
+    snprintf(cmd, sizeof cmd, "AT+QMTSUB=0,2,\"location/%s\",1", s_loc);
     return at(cmd, "+QMTSUB:", line, NULL, 15000) && sscanf(line, "+QMTSUB: %*d,%*d,%d", &result) == 1 && result == 0;
 }
 
@@ -267,16 +290,16 @@ static void sync_time(void)
     esp_event_post(GX5_EVENT, GX5_EV_TIME, &utc, sizeof utc, 0);
 }
 
-static void publish(msg_t *m)
+static void publish(const char *topic, const msg_t *m)
 {
     static uint16_t id;
     char cmd[160];
     int qos = m->retain ? 1 : 0;
 
     if (qos && ++id == 0) id = 1; // BG96: msgid must be non-zero for QoS > 0
-    snprintf(cmd, sizeof cmd, "AT+QMTPUB=0,%u,%d,%d,\"%s\",%u", qos ? id : 0, qos, m->retain, m->topic, (unsigned)strlen(m->data));
+    snprintf(cmd, sizeof cmd, "AT+QMTPUB=0,%u,%d,%d,\"%s\",%u", qos ? id : 0, qos, m->retain, topic, (unsigned)strlen(m->data));
     if (!at(cmd, "+QMTPUB:", NULL, m->data, 15000)) s_connected = false; // reconnect
-    if (strstr(m->topic, "/telemetry")) refresh_fix();                    // for the next one
+    if (strstr(topic, "/telemetry")) refresh_fix();                    // for the next one
 }
 
 // 'm' = message in *m, 'u' = UART activity, 0 = timeout. Queues are only ever
@@ -313,7 +336,9 @@ static void serve(void)
         if (w == 'u') {
             while (read_line(line, sizeof line, xTaskGetTickCount() + pdMS_TO_TICKS(100))) urc(line);
         } else if (m.type == M_PUB) {
-            publish(&m);
+            char topic[96];
+            full_topic(topic, sizeof topic, m.topic);
+            publish(topic, &m);
         } else if (m.type == M_STOP || m.type == M_RECONNECT) {
             break;
         }
@@ -357,14 +382,15 @@ static void load_broker(void)
 }
 
 // Tell whoever runs this broker who we are and why we are here:
-// discovery/<id> on the bootstrap broker, <prefix>/<id>/event otherwise.
+// discovery/<id> on the bootstrap broker, device/<id>/<location>/event otherwise.
 static void announce(const char *reason)
 {
     msg_t m = {.type = M_PUB};
-    if (s_provisioning) snprintf(m.topic, sizeof m.topic, "discovery/%s", s_id);
-    else snprintf(m.topic, sizeof m.topic, "%s/%s/event", CONFIG_GX5_MQTT_TOPIC_PREFIX, s_id);
+    char topic[96];
+    if (s_provisioning) snprintf(topic, sizeof topic, "discovery/%s", s_id);
+    else full_topic(topic, sizeof topic, "event");
     snprintf(m.data, sizeof m.data, "{\"id\":\"%s\",\"fw\":\"%s\",\"reason\":\"%s\"}", s_id, esp_app_get_description()->version, reason);
-    publish(&m);
+    publish(topic, &m);
 }
 
 static void modem_task(void *arg)
@@ -379,6 +405,7 @@ static void modem_task(void *arg)
                               : s_have_stored && s_fails < CONFIG_GX5_PROVISION_AFTER_FAILS ? &s_stored
                               : &s_boot;
         if (!s_stop) {
+            if (s_loc_dirty) load_loc();
             esp_pm_lock_acquire(s_awake);
             s_abortable = true;
             bool net = bringup(); // the network comes first: no broker is reachable without it
@@ -455,7 +482,7 @@ bool gx5_mqtt_publish(const char *subtopic, const char *payload, bool retain)
 {
     msg_t m = {.type = M_PUB, .retain = retain};
     if (!s_connected) return false;
-    snprintf(m.topic, sizeof m.topic, "%s/%s/%s", CONFIG_GX5_MQTT_TOPIC_PREFIX, s_id, subtopic);
+    strlcpy(m.topic, subtopic, sizeof m.topic);
     strlcpy(m.data, payload, sizeof m.data);
     return xQueueSend(s_msgq, &m, pdMS_TO_TICKS(2000)) == pdTRUE; // brief wait rides out a burst
 }
@@ -468,6 +495,17 @@ void gx5_broker_set(const gx5_broker_t *b)
     s_cand = *b;
     s_have_cand = true; // set last: the modem task reads s_cand only after this
     xQueueSend(s_msgq, &m, pdMS_TO_TICKS(1000));
+}
+
+void gx5_location_set(const char *loc, bool reconnect)
+{
+    msg_t m = {.type = M_RECONNECT};
+    nvs_handle_t h;
+    if (nvs_open("gx5", NVS_READWRITE, &h) != ESP_OK) return;
+    if (nvs_set_str(h, "loc", loc) != ESP_OK || nvs_commit(h) != ESP_OK) ESP_LOGE(TAG, "location not saved");
+    nvs_close(h);
+    s_loc_dirty = true; // the modem task picks it up before its next connect
+    if (reconnect) xQueueSend(s_msgq, &m, pdMS_TO_TICKS(1000));
 }
 
 void gx5_modem_stop(bool power_off)

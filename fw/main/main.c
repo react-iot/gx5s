@@ -159,7 +159,7 @@ static void deep_sleep(bool protect)
     bool feed = bat < CONFIG_GX5_BAT_MIN_MV;
     ESP_LOGW(TAG, "%s: vcc=%d mV bat=%d mV ign=%d feed=%d", protect ? "PROTECT" : "SLEEP", vcc_mv(), bat, s_ign, feed);
     if (!s_connected && !protect) store_telemetry(); // an offline heartbeat still leaves a record
-    gx5_mqtt_publish("status", protect ? "protect" : "sleep", true);
+    gx5_mqtt_publish("status/connected", protect ? "protect" : "sleep", true);
     gx5_modem_stop(protect);
     gx5_exp_set(GX5_EXP_GSM_SLP, true); // DTR high: the modem may now sleep; low again at boot (expander init)
     gx5_can_stop();
@@ -305,7 +305,7 @@ static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
     case GX5_EV_MQTT_CONNECTED:
         s_connected = true;
         gx5_exp_set(GX5_EXP_LED_SVR, true);
-        gx5_mqtt_publish("status", gx5_mqtt_provisioning() ? "provisioning" : "online", true);
+        gx5_mqtt_publish("status/connected", gx5_mqtt_provisioning() ? "provisioning" : "online", true);
         publish_telemetry();
         maybe_linger();
         break;
@@ -327,8 +327,18 @@ static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
                 break;
             }
             const char *cfg = gx5_json_val(prov, "config");
-            if (cfg) gx5_can_command(cfg); // "config":{"can":{...}}
-            if (gx5_parse_broker(prov, &b)) {
+            char loc[GX5_LOC_LEN];
+            bool new_broker = gx5_parse_broker(prov, &b);
+            if (cfg) gx5_can_command(cfg); // "config":{"can":{...},"location":"0001"}
+            if (cfg && gx5_json_val(cfg, "location")) {
+                if (gx5_json_str(cfg, "location", loc, sizeof loc) && gx5_id_ok(loc)) {
+                    ESP_LOGI(TAG, "new location: %s", loc);
+                    gx5_location_set(loc, !new_broker);
+                } else {
+                    ESP_LOGW(TAG, "location ignored: 1-9 of A-Z a-z 0-9 _ -");
+                }
+            }
+            if (new_broker) {
                 ESP_LOGI(TAG, "new broker: %s:%d", b.host, b.port);
                 apply_ignition(); // ignition off: fresh connect window to try it
                 gx5_broker_set(&b);
