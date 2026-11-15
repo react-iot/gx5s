@@ -146,6 +146,31 @@ def report():
     for d in late[:20]:
         print(f"  {d[1]}  {d[0]} s, woke by {d[2]}")
 
+    # Battery health: the LiPo carries the board while asleep, so its voltage at each
+    # wake (before the charger has done anything) and the drop per sleep show its state.
+    wakes = [b for b in boots if b["rst"] == "deep-sleep"]
+    if wakes:
+        bat = [int(b["bat_mv"]) for b in wakes]
+        days = (int(wakes[-1]["epoch"]) - int(wakes[0]["epoch"])) / 86400
+        print(f"\nLiPo at wake: first {bat[0]} mV, last {bat[-1]} mV, min {min(bat)}, max {max(bat)}" +
+              (f", trend {(bat[-1] - bat[0]) / days:+.0f} mV/day" if days > 0.5 else ""))
+        drops, prev = [], None  # (mV lost, hours asleep) for each sleep -> wake pair
+        for e in ev:
+            if e["event"] == "sleep":
+                prev = e
+            elif e["event"] == "boot" and prev and e["rst"] == "deep-sleep":
+                h = (int(e["epoch"]) - int(prev["epoch"])) / 3600
+                if h > 0.05:
+                    drops.append((int(prev["bat_mv"]) - int(e["bat_mv"])) / h)
+                prev = None
+        if drops:
+            print(f"LiPo drop while asleep: avg {sum(drops) / len(drops):.0f} mV/h, worst {max(drops):.0f} mV/h over {len(drops)} sleeps")
+        vcc = [int(b["vcc_mv"]) for b in wakes]
+        print(f"supply at wake: min {min(vcc)} mV, max {max(vcc)} mV")
+        print("  time                  wake      LiPo mV  supply mV")
+        for b in wakes[-12:]:
+            print(f"  {b['time']}  {b['wake']:8s}  {b['bat_mv']:>7s}  {b['vcc_mv']:>9s}")
+
     # Trouble: anything that is not a clean power-on at the start or a deep-sleep wake.
     bad = [b for b in boots[1:] if b["rst"] != "deep-sleep"] + [e for e in ev if e["event"] == "fault" or e["event"].startswith("pi-i2c")]
     print(f"\nunexpected resets, faults, rig errors: {len(bad)}")
