@@ -131,6 +131,11 @@ set `GX5_MQTT_TLS_SECLEVEL=0` for an unauthenticated (insecure) link while testi
 supply and ignition, measures its current and sends CAN frames; the console comes through
 [ESP32 Workbench](https://github.com/react-iot/esp32-workbench) on the Pi.
 
+Long runs: `soak.py` on the same Pi logs the supply current once a second and every boot
+(wake cause, reset reason), sleep and fault from the console to `~/gx5s-soak`, with a
+10-minute ignition cycle every 6 hours. `sudo systemctl start gx5s-soak` starts it,
+`python3 soak.py report` summarises; stop it before running pytest (both drive the hat).
+
 ```sh
 scp fw/test/bench/* can-workbench:gx5s-bench/
 ssh can-workbench 'sudo bash gx5s-bench/setup-pi.sh && sudo reboot'    # once

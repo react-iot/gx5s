@@ -76,6 +76,24 @@ KillMode=mixed
 WantedBy=multi-user.target
 EOF
 
+# Soak logger (soak.py, copied to ~/gx5s-bench with test_bench.py). Not enabled:
+# start it for a long run, stop it before running pytest (both drive the hat).
+cat >/etc/systemd/system/gx5s-soak.service <<EOF
+[Unit]
+Description=GX5s soak logger (supply current, wake and sleep events)
+After=esp32-workbench.service
+
+[Service]
+User=$U
+WorkingDirectory=$H/gx5s-bench
+ExecStart=/usr/bin/python3 -u soak.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
 systemctl daemon-reload
 systemctl enable can0.service esp32-workbench.service
 echo "Done. Reboot, then check: ip -br link show can0; i2cdetect -y 1; curl localhost:4000/api/ports"
