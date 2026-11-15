@@ -209,7 +209,9 @@ static void rtc_init(void)
     int mo = dec(d[5] & 0x1f), day = dec(d[3] & 0x3f);
     if (mo < 1 || mo > 12 || day < 1) return;
     struct timeval tv = {.tv_sec = gx5_epoch(2000 + dec(d[6]), mo, day, dec(d[2] & 0x3f), dec(d[1] & 0x7f), dec(d[0] & 0x7f))};
-    if (tv.tv_sec > 1700000000) settimeofday(&tv, NULL);
+    if (tv.tv_sec <= 1700000000) return;
+    settimeofday(&tv, NULL);
+    ESP_LOGI(TAG, "clock from RTC: %lld", (long long)tv.tv_sec);
 }
 
 void gx5_i2c_init(void)

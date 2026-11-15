@@ -3,12 +3,18 @@ menu "GX5s application"
     config GX5_MANUFACTURER
         string "Manufacturer (startup banner)"
         default "React IoT"
+    config GX5_WEBSITE
+        string "Manufacturer website (startup banner)"
+        default "reactiot.com.au"
+    config GX5_REPO
+        string "Source repository (startup banner)"
+        default "github.com/react-iot/gx5s"
     config GX5_PRODUCT_NAME
         string "Product name (startup banner)"
         default "GX5s Logger"
     config GX5_PRODUCT_ID
         string "Hardware id (startup banner)"
-        default "GX5s-v210620"
+        default "riot-gx5s"
 
     menu "Supply protection"
         config GX5_VCC_CUTOFF_MV

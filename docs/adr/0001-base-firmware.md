@@ -53,7 +53,8 @@ Status: accepted (2026-11-15)
    (`urc/ri/other` pulse + `urc/delay`), since UART bytes are lost in light sleep and
    ESP32 UART wake only works on IO_MUX pins. `GX5_LIGHT_SLEEP=n` turns it off.
 8. **Provisioning.** The broker is not compiled in. Firmware carries only a
-   *bootstrap* broker (menuconfig). Selection each connect: candidate > stored (NVS
+   *bootstrap* broker (menuconfig; default `mqtt.reactiot.com.au:1883`, no TLS, so the
+   provisioning message and the credentials in it travel unencrypted). Selection each connect: candidate > stored (NVS
    `gx5/broker`) > bootstrap.
    - Device id = factory MAC with the last byte + 3, as `AA:BB:CC:DD:EE:FF`, printed in a startup banner.
    - Bootstrap connects anonymously (no username/password), client id = device id, so
@@ -110,10 +111,13 @@ Status: accepted (2026-11-15)
      states (the regulator only changes mode). Latched INT on the GPIO12 strap is a known risk on
      modules without the flash-voltage eFuse (see `GX5_MOTION_WAKE` help).
    - **PCF8563**: sets the system clock at boot if valid; rewritten from network
-     time (`AT+CCLK?`, `AT+CTZU=1`) on every connect. Telemetry `ts` is 0 until then.
-     Bench 2026-11-16 (`test_rtc_sets_clock`): the Pi sets the RTC 400 days back over
-     the shared bus and the board boots with that time. The write path (network time
-     to RTC) is not tested: it needs a broker connection.
+     time (`AT+CCLK?`, `AT+CTZU=1`) each time the network comes up (no broker needed). Telemetry `ts` is 0 until then.
+     GPS time does the same on every fix (host-tested only: no fix on the bench).
+     With `CTZU=1` the modem clock is UTC and the zone suffix is not applied (bench:
+     `19:21:05+32` at 19:21:04 UTC in a UTC+8 zone). Bench 2026-11-16: the Pi sets
+     the RTC 400 days back with the board in reset; it boots with that time
+     (`test_rtc_sets_clock`), then network time corrects the RTC with no broker
+     (`test_network_time_sets_rtc`).
    - **CAN**: see §10.
    - **SD NAND**: offline telemetry queue (`/sd/queue.txt` + offset file). Powered
      and mounted per operation. GPIO2 supplies the NAND directly, so it is driven at
@@ -220,6 +224,21 @@ Status: accepted (2026-11-15)
     particular external sensor yet. The Pi is a second master on that bus during
     bench runs; no collisions seen, but nothing prevents them.
 
+16. **OTA** (`gx5_modem`). Flash (16 MB): `nvs` 20 K, `otadata`, two app slots of 4 MB and
+    a 7.9 MB `storage` data partition, unused today (`fw/partitions.csv`). The table
+    cannot be changed by OTA, so the whole flash is laid out now; the image is ~420 K. `{"cmd":"ota","version":"1.4.2"}` (no version = `latest`) makes the modem
+    GET `<GX5_OTA_URL>/fw/<hardware id>-<version>.bin?id=<id>&v=<running>` into its
+    own file system (`AT+QHTTPGET`, `AT+QHTTPREADFILE`); the image is then pulled
+    across in 1 KB pieces (`AT+QFREAD`), written to the other slot, checked
+    (`esp_ota_end`) and booted. Pulling instead of streaming keeps the UART from
+    overrunning while flash is written. The result goes to `event`
+    (`{"ev":"ota","version","result"}`); the device stays awake until it is done.
+    Limits: plain http and no signature, so whoever answers for the host can install
+    firmware; no rollback if the new image boots but misbehaves. Built and flashed,
+    boots from slot 0; **the update itself has never run** (needs a broker connection
+    and an image on the server). AT syntax taken from Quectel's HTTP(S) manual (BG96)
+    and FILE note (BG95 series).
+
 ## Not done (add when needed)
 
-OTA, Tesla / ALDL / CANopen decoders, a protocol for whatever sits on the external UART, SMS parsing.
+Signed or https OTA and rollback, Tesla / ALDL / CANopen decoders, a protocol for whatever sits on the external UART, SMS parsing.

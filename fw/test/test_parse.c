@@ -55,8 +55,8 @@ int main(void)
     assert(gx5_epoch(2024, 2, 29, 23, 59, 59) == 1709251199);
 
     long long utc;
-    assert(gx5_parse_cclk("+CCLK: \"26/11/15,22:30:45+40\"", &utc) && utc == 1794745845); // UTC+10
-    assert(gx5_parse_cclk("+CCLK: \"26/11/15,07:30:45-20\"", &utc) && utc == 1794745845); // UTC-5
+    assert(gx5_parse_cclk("+CCLK: \"26/11/15,12:30:45+32\"", &utc) && utc == 1794745845); // already UTC: zone ignored
+    assert(gx5_parse_cclk("+CCLK: \"26/11/15,12:30:45-20\"", &utc) && utc == 1794745845);
     assert(!gx5_parse_cclk("+CCLK: \"80/01/06,00:00:10+00\"", &utc));                     // never synced
     assert(!gx5_parse_cclk("+CCLK: garbage", &utc));
     assert(!gx5_parse_cclk("+CCLK: \"26/13/15,22:30:45+40\"", &utc));
@@ -78,14 +78,17 @@ int main(void)
     assert(gx5_id_ok("0000") && gx5_id_ok("a05") && gx5_id_ok("Depot_1-N"));
     assert(!gx5_id_ok("") && !gx5_id_ok("0123456789") && !gx5_id_ok("a/b") && !gx5_id_ok("a+") && !gx5_id_ok("a\"b") && !gx5_id_ok("a b"));
 
+    assert(gx5_ver_ok("latest") && gx5_ver_ok("1.4.2") && !gx5_ver_ok("") && !gx5_ver_ok("1/2") && !gx5_ver_ok("a&b") && !gx5_ver_ok("0123456789abcdef"));
+
     char fix[128];
-    assert(gx5_fix_json("+QGPSLOC: 061951.0,-33.86785,151.20732,0.7,62.2,2,113.48,48.6,26.2,151126,09", fix, sizeof fix));
+    assert(gx5_fix_json("+QGPSLOC: 061951.0,-33.86785,151.20732,0.7,62.2,2,113.48,48.6,26.2,151126,09", fix, sizeof fix, &utc));
+    assert(utc == 1794723591); // 2026-11-15 06:19:51 UTC, from the fix
     assert(!strcmp(fix, ",\"lat\":-33.86785,\"lon\":151.20732,\"kmh\":48.6,\"cog\":113.48,\"sat\":9")); // "09" -> 9
-    assert(!gx5_fix_json("+QGPSLOC: 061951.0,-33.86785,151.20732", fix, sizeof fix));                               // truncated
-    assert(!gx5_fix_json("+QGPSLOC: 061951.0,3352.0710S,15112.4392E,0.7,62.2,2,113.48,48.6,26.2,151126,09", fix, sizeof fix)); // not decimal
-    assert(!gx5_fix_json("+QGPSLOC: 061951.0,,151.20732,0.7,62.2,2,113.48,48.6,26.2,151126,09", fix, sizeof fix));
-    assert(!gx5_fix_json("+QGPSLOC: 061951.0,-33.86785,151.20732,0.7,62.2,2,113.48,48.6,26.2,151126,09", fix, 20));   // no room
-    assert(!gx5_fix_json("+QGPSLOC", fix, sizeof fix));
+    assert(!gx5_fix_json("+QGPSLOC: 061951.0,-33.86785,151.20732", fix, sizeof fix, NULL));                               // truncated
+    assert(!gx5_fix_json("+QGPSLOC: 061951.0,3352.0710S,15112.4392E,0.7,62.2,2,113.48,48.6,26.2,151126,09", fix, sizeof fix, NULL)); // not decimal
+    assert(!gx5_fix_json("+QGPSLOC: 061951.0,,151.20732,0.7,62.2,2,113.48,48.6,26.2,151126,09", fix, sizeof fix, NULL));
+    assert(!gx5_fix_json("+QGPSLOC: 061951.0,-33.86785,151.20732,0.7,62.2,2,113.48,48.6,26.2,151126,09", fix, 20, NULL));   // no room
+    assert(!gx5_fix_json("+QGPSLOC", fix, sizeof fix, NULL));
 
     puts("ok");
     return 0;

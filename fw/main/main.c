@@ -343,6 +343,15 @@ static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
                 apply_ignition(); // ignition off: fresh connect window to try it
                 gx5_broker_set(&b);
             }
+        } else if (gx5_json_str(m->data, "cmd", ext, sizeof ext) && !strcmp(ext, "ota")) {
+            // {"cmd":"ota","version":"1.4.2"}; no version = "latest"
+            char ver[16];
+            if (!gx5_json_str(m->data, "version", ver, sizeof ver) || (ver[0] && !gx5_ver_ok(ver))) {
+                ESP_LOGW(TAG, "ota: bad version");
+            } else {
+                ESP_LOGI(TAG, "ota requested: %s", ver[0] ? ver : "latest");
+                gx5_ota_start(ver[0] ? ver : "latest");
+            }
         } else if (gx5_can_command(m->data)) {
             // applied and stored by can.c
         } else if (gx5_json_str(m->data, "ext", ext, sizeof ext) && ext[0]) {
@@ -394,7 +403,9 @@ static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         break;
     }
     case GX5_EV_SLEEP_DUE:
-        if (!s_ign) deep_sleep(false);
+        if (s_ign) break;
+        if (gx5_ota_busy()) esp_timer_start_once(s_t_sleep, SEC(CONFIG_GX5_LINGER_S)); // let the update finish
+        else deep_sleep(false);
         break;
     }
 }
@@ -449,13 +460,14 @@ void app_main(void)
     mac[5] += 3; // device id = factory MAC + 3
     snprintf(s_id, sizeof s_id, "%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     printf("############################################################\n");
-    printf("## %-54s ##\n", CONFIG_GX5_MANUFACTURER);
+    printf("## %-54s ##\n", CONFIG_GX5_MANUFACTURER " - " CONFIG_GX5_WEBSITE);
     printf("## %-54s ##\n", CONFIG_GX5_PRODUCT_NAME);
     gx5_pop(mac, s_pop);
     printf("## ID: %-50s ##\n", s_id);
     printf("## PIN: %-49s ##\n", s_pop);
     printf("## HW: %-50s ##\n", CONFIG_GX5_PRODUCT_ID);
     printf("## FW: v%-49s ##\n", esp_app_get_description()->version);
+    printf("## %-54s ##\n", CONFIG_GX5_REPO);
     printf("############################################################\n");
 
     vTaskDelay(pdMS_TO_TICKS(300)); // regulator + ACC/VCC dividers settle

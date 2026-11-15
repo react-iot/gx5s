@@ -7,8 +7,10 @@
 #include "esp_app_desc.h"
 #include "esp_attr.h"
 #include "esp_log.h"
+#include "esp_ota_ops.h"
 #include "esp_pm.h"
 #include "esp_sleep.h"
+#include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
@@ -26,7 +28,7 @@
 static const char *TAG = "modem";
 
 typedef struct {
-    enum { M_PUB, M_RI, M_STOP, M_RECONNECT } type;
+    enum { M_PUB, M_RI, M_STOP, M_RECONNECT, M_OTA } type; // M_OTA: version in data
     bool retain;
     char topic[96]; // queued M_PUB: subtopic only; the modem task adds device/<id>/<location>/
     char data[GX5_PUB_MAX];
@@ -136,7 +138,7 @@ static bool at(const char *cmd, const char *expect, char *out, const char *paylo
         } else if (!strncmp(line, "ERROR", 5) || !strncmp(line, "+CME ERROR", 10) || !strncmp(line, "+CMS ERROR", 10)) {
             if (strncmp(cmd, "AT+QGPS", 7)) ESP_LOGW(TAG, "%.*s -> %s", name, cmd, line); // "no fix yet" is routine
             return false;
-        } else if (payload && !strcmp(line, ">")) {
+        } else if (payload && (!strcmp(line, ">") || !strcmp(line, "CONNECT"))) { // data prompts
             uart_write_bytes(UART, payload, strlen(payload));
         } else if (expect && !strncmp(line, expect, strlen(expect))) {
             got = true;
@@ -256,11 +258,16 @@ static portMUX_TYPE s_fix_mux = portMUX_INITIALIZER_UNLOCKED;
 static void refresh_fix(void)
 {
     char line[LINE_LEN] = "", fix[sizeof s_fix] = "";
-    if (!at("AT+QGPSLOC=2", "+QGPSLOC:", line, NULL, 2000) || !gx5_fix_json(line, fix, sizeof fix)) {
+    long long t = 0;
+    if (!at("AT+QGPSLOC=2", "+QGPSLOC:", line, NULL, 2000) || !gx5_fix_json(line, fix, sizeof fix, &t)) {
         fix[0] = '\0';
         at("AT+QGPS?", "+QGPS:", line, NULL, 2000); // 1 = receiver running, just no fix yet
     }
     ESP_LOGI(TAG, "gnss %s", fix[0] ? fix + 1 : line[0] ? line : "no answer");
+    if (fix[0] && t) { // GPS time: the clocks follow every fix
+        int64_t utc = t;
+        esp_event_post(GX5_EVENT, GX5_EV_TIME, &utc, sizeof utc, 0);
+    }
     portENTER_CRITICAL(&s_fix_mux);
     strcpy(s_fix, fix);
     portEXIT_CRITICAL(&s_fix_mux);
@@ -280,12 +287,15 @@ static void refresh_fix(void) {}
 size_t gx5_gnss_fix(char *out, size_t size) { return 0; }
 #endif
 
-// Network time -> GX5_EV_TIME; the application sets the clocks.
+// Network time -> GX5_EV_TIME; the application sets the clocks. GPS time (refresh_fix)
+// does the same whenever there is a fix.
 static void sync_time(void)
 {
     char line[LINE_LEN];
     long long t;
-    if (!at("AT+CCLK?", "+CCLK:", line, NULL, 2000) || !gx5_parse_cclk(line, &t)) return;
+    bool ok = at("AT+CCLK?", "+CCLK:", line, NULL, 2000) && gx5_parse_cclk(line, &t);
+    ESP_LOGI(TAG, "time %s%s", line, ok ? "" : " (not used)");
+    if (!ok) return;
     int64_t utc = t;
     esp_event_post(GX5_EVENT, GX5_EV_TIME, &utc, sizeof utc, 0);
 }
@@ -300,6 +310,84 @@ static void publish(const char *topic, const msg_t *m)
     snprintf(cmd, sizeof cmd, "AT+QMTPUB=0,%u,%d,%d,\"%s\",%u", qos ? id : 0, qos, m->retain, topic, (unsigned)strlen(m->data));
     if (!at(cmd, "+QMTPUB:", NULL, m->data, 15000)) s_connected = false; // reconnect
     if (strstr(topic, "/telemetry")) refresh_fix();                    // for the next one
+}
+
+// ── OTA ─────────────────────────────────────────────────────────────────────
+// The modem downloads the image into its own file system (AT+QHTTPGET +
+// QHTTPREADFILE), then it is pulled across in 1 KB pieces (AT+QFREAD) and written
+// to the other app slot. Pulling keeps the UART from overrunning during flash writes.
+static volatile bool s_ota;
+
+// AT+QFREAD=<fh>,<n> -> "CONNECT <got>\r\n" <got raw bytes> "\r\nOK". Returns got, -1 on error.
+static int file_read(int fh, uint8_t *buf, int n)
+{
+    char cmd[40], line[LINE_LEN];
+    int got = -1;
+    uint8_t lf;
+    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(5000);
+    snprintf(cmd, sizeof cmd, "AT+QFREAD=%d,%d\r", fh, n);
+    uart_write_bytes(UART, cmd, strlen(cmd));
+    while (read_line(line, sizeof line, deadline)) {
+        if (sscanf(line, "CONNECT %d", &got) == 1) break;
+        if (strstr(line, "ERROR")) return -1;
+    }
+    if (got < 0 || got > n || uart_read_bytes(UART, &lf, 1, pdMS_TO_TICKS(500)) != 1 || lf != '\n') return -1;
+    if (uart_read_bytes(UART, buf, got, pdMS_TO_TICKS(3000)) != got) return -1;
+    while (read_line(line, sizeof line, deadline))
+        if (!strcmp(line, "OK")) return got;
+    return -1;
+}
+
+// Returns why it failed; on success the device restarts into the new image.
+static const char *ota(const char *ver)
+{
+    static uint8_t buf[1024];
+    char url[200], cmd[64], line[LINE_LEN];
+    int err = -1, code = 0, size = 0, fh = -1, done = 0;
+    esp_ota_handle_t h;
+    const esp_partition_t *part = esp_ota_get_next_update_partition(NULL);
+    const char *why = NULL;
+
+    if (!part) return "no-ota-slot";
+    int n = snprintf(url, sizeof url, CONFIG_GX5_OTA_URL "/fw/" CONFIG_GX5_PRODUCT_ID "-%s.bin?id=%s&v=%s", ver, s_id, esp_app_get_description()->version);
+    if (n >= (int)sizeof url) return "url-too-long";
+    ESP_LOGI(TAG, "ota %s", url);
+    AT("AT+QHTTPCFG=\"contextid\",1");
+    AT("AT+QHTTPCFG=\"responseheader\",0"); // body only
+    snprintf(cmd, sizeof cmd, "AT+QHTTPURL=%d,30", n);
+    if (!at(cmd, NULL, NULL, url, 35000)) return "url-rejected";
+    // +QHTTPGET: <err>[,<http status>[,<content length>]]
+    if (!at("AT+QHTTPGET=80", "+QHTTPGET:", line, NULL, 90000) || sscanf(line, "+QHTTPGET: %d,%d,%d", &err, &code, &size) < 2 || err || code != 200) {
+        ESP_LOGE(TAG, "ota: %s", line);
+        return code == 404 ? "no-such-firmware" : "download-failed";
+    }
+    if (size <= 0 || size > (int)part->size) return "bad-size";
+    at("AT+QFDEL=\"ota.bin\"", NULL, NULL, NULL, 5000); // left over from a failed try; may fail
+    if (!at("AT+QHTTPREADFILE=\"ota.bin\",80", "+QHTTPREADFILE:", line, NULL, 900000) || gx5_last_int(line) != 0) return "download-failed";
+    if (!at("AT+QFOPEN=\"ota.bin\",2", "+QFOPEN:", line, NULL, 5000) || sscanf(line, "+QFOPEN: %d", &fh) != 1) return "file-open-failed";
+
+    if (esp_ota_begin(part, size, &h) != ESP_OK) {
+        why = "flash-begin-failed";
+    } else {
+        while (done < size) {
+            int got = file_read(fh, buf, size - done < (int)sizeof buf ? size - done : (int)sizeof buf);
+            if (got <= 0 || esp_ota_write(h, buf, got) != ESP_OK) break;
+            done += got;
+            if (done % (64 * 1024) < got) ESP_LOGI(TAG, "ota %d / %d", done, size);
+        }
+        if (done != size) {
+            esp_ota_abort(h);
+            why = "transfer-failed";
+        } else if (esp_ota_end(h) != ESP_OK) { // checks the image (magic, checksum, SHA-256)
+            why = "bad-image";
+        } else if (esp_ota_set_boot_partition(part) != ESP_OK) {
+            why = "set-boot-failed";
+        }
+    }
+    snprintf(cmd, sizeof cmd, "AT+QFCLOSE=%d", fh);
+    AT(cmd);
+    AT("AT+QFDEL=\"ota.bin\"");
+    return why;
 }
 
 // 'm' = message in *m, 'u' = UART activity, 0 = timeout. Queues are only ever
@@ -339,6 +427,20 @@ static void serve(void)
             char topic[96];
             full_topic(topic, sizeof topic, m.topic);
             publish(topic, &m);
+        } else if (m.type == M_OTA) {
+            char topic[96];
+            msg_t r = {.type = M_PUB};
+            s_ota = true;
+            const char *why = ota(m.data);
+            s_ota = false;
+            ESP_LOGW(TAG, "ota %s", why ? why : "done, restarting");
+            snprintf(r.data, sizeof r.data, "{\"ev\":\"ota\",\"version\":\"%.15s\",\"result\":\"%s\"}", m.data, why ? why : "ok");
+            full_topic(topic, sizeof topic, "event");
+            publish(topic, &r);
+            if (!why) {
+                at("AT+QMTDISC=0", "+QMTDISC:", NULL, NULL, 5000);
+                esp_restart();
+            }
         } else if (m.type == M_STOP || m.type == M_RECONNECT) {
             break;
         }
@@ -412,6 +514,7 @@ static void modem_task(void *arg)
             ESP_LOGI(TAG, "network %s", net ? "up" : "down");
             if (net) {
                 log_network();
+                sync_time(); // network time needs the cell, not a broker
                 refresh_fix();
             }
             bool up = false;
@@ -445,7 +548,6 @@ static void modem_task(void *arg)
                 backoff_s = 5;
                 s_provisioning = b == &s_boot;
                 s_connected = s_session = true;
-                sync_time();
                 if (note) announce(note);
                 else if (s_provisioning) announce(s_have_stored ? "broker-unreachable" : "unprovisioned");
                 note = NULL;
@@ -488,6 +590,15 @@ bool gx5_mqtt_publish(const char *subtopic, const char *payload, bool retain)
 }
 
 bool gx5_mqtt_provisioning(void) { return s_provisioning; }
+
+void gx5_ota_start(const char *version)
+{
+    msg_t m = {.type = M_OTA};
+    strlcpy(m.data, version, sizeof m.data);
+    if (s_connected) xQueueSend(s_msgq, &m, pdMS_TO_TICKS(1000));
+}
+
+bool gx5_ota_busy(void) { return s_ota; }
 
 void gx5_broker_set(const gx5_broker_t *b)
 {

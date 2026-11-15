@@ -153,21 +153,34 @@ def rtc_write(hat, t):
                                               (g.tm_wday + 1) % 7, bcd(g.tm_mon), bcd(g.tm_year % 100)])
 
 
+def boot_with_rtc(hat, con, t):
+    """Set the RTC to t with the board held in reset (running, it rewrites the RTC from
+    network time every few seconds), then let it boot. Returns the clock it starts with."""
+    con.s.dtr = False
+    con.s.rts = True
+    time.sleep(0.3)
+    rtc_write(hat, t)
+    con.reset()
+    return int(con.expect(r"io: clock from RTC: (\d+)", 10)[1])
+
+
 def test_rtc_sets_clock(hat, con):
-    # A time 400 days back can only have come from the RTC (network time needs a broker).
+    # At boot the system clock comes from the RTC (network or GPS time corrects it later).
     back = 400 * 86400
-    rtc_write(hat, int(time.time()) - back)
-    try:
-        con.reset()
-        con.expect(BOOT, 10)
-        hat.acc(True)
-        m = con.expect(r'telemetry \{"ts":(\d+)', 10)
-        off = int(m[1]) - (time.time() - back)  # the RTC kept running since it was set
-        assert abs(off) <= 3, f"clock is {off:.0f} s off the RTC"
-    finally:
-        rtc_write(hat, int(time.time()))  # leave the RTC right
-        hat.acc(False)
-    con.expect(r"ignition off", 5)
+    off = boot_with_rtc(hat, con, int(time.time()) - back) - (time.time() - back)
+    assert abs(off) <= 3, f"clock is {off:.0f} s off the RTC"
+
+
+def test_network_time_sets_rtc(hat, con):
+    # The modem's network time (UTC) must reach the RTC without any broker. Needs a SIM
+    # and coverage. Follows test_rtc_sets_clock: the RTC is still 400 days behind.
+    import calendar
+    con.expect(r"modem: time ", 200)
+    time.sleep(1)
+    d = hat.bus.read_i2c_block_data(0x51, 0x02, 7)
+    dec = lambda b: (b >> 4) * 10 + (b & 0x0F)
+    rtc = calendar.timegm((2000 + dec(d[6]), dec(d[5] & 0x1F), dec(d[3] & 0x3F), dec(d[2] & 0x3F), dec(d[1] & 0x7F), dec(d[0] & 0x7F)))
+    assert abs(rtc - time.time()) <= 5, f"RTC is {rtc - time.time():.0f} s off after network time"
 
 
 def test_ignition_on(hat, con):

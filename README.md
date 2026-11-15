@@ -88,6 +88,14 @@ nothing and publishes `provision-rejected`. The same message on the production b
 device again. After `GX5_PROVISION_AFTER_FAILS` failed connects it checks
 back with the bootstrap broker. `idf.py erase-flash` returns a device to unprovisioned.
 
+Firmware update: `{"cmd":"ota","version":"1.4.2"}` (no version = `latest`) on a command topic.
+The modem fetches `<GX5_OTA_URL>/fw/<hardware id>-<version>.bin` (default
+`http://ota.reactiot.com.au`), the device writes it to its second app slot, restarts and
+reports `{"ev":"ota","version":"…","result":"ok"}` (or the reason it failed) on `event`.
+
+The clock comes from the RTC at boot and is corrected from network time whenever the cell
+is up and from GPS time on every fix; all times are UTC.
+
 CAN is configured over the command topic and kept across reboots:
 
 ```json

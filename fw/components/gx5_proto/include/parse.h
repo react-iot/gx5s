@@ -102,6 +102,13 @@ static inline bool gx5_id_ok(const char *s)
     return n && n < GX5_LOC_LEN && !s[n];
 }
 
+// A firmware version goes into a URL: 1..15 of [A-Za-z0-9._-].
+static inline bool gx5_ver_ok(const char *s)
+{
+    size_t n = strspn(s, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-");
+    return n && n < 16 && !s[n];
+}
+
 // Provisioning PIN (proof of possession): the last three bytes of the device id as
 // one decimal number, 8 digits. C4:DD:57:E0:9F:AF -> 0xE09FAF -> "14720943".
 static inline void gx5_pop(const uint8_t id[6], char out[9])
@@ -148,16 +155,16 @@ static inline long long gx5_epoch(int y, int mo, int d, int h, int mi, int s)
     return days * 86400 + h * 3600 + mi * 60 + s;
 }
 
-// `+CCLK: "yy/MM/dd,hh:mm:ss+zz"` (local time, zz = quarter hours east of UTC)
-// -> UTC epoch. False if malformed or the modem clock was never set (year < 2024).
+// `+CCLK: "yy/MM/dd,hh:mm:ss+zz"` -> UTC epoch. With AT+CTZU=1 (as set at bring-up)
+// the modem clock is already UTC and zz is only the local zone, so zz is not applied
+// (bench: "19:21:05+32" at 19:21:04 UTC, in a UTC+8 zone). False if malformed or the modem clock was never set (year < 2024).
 static inline bool gx5_parse_cclk(const char *line, long long *utc)
 {
-    int y, mo, d, h, mi, s, tz = 0;
-    char sign = '+';
+    int y, mo, d, h, mi, s;
     const char *q = strchr(line, '"');
-    if (!q || sscanf(q + 1, "%d/%d/%d,%d:%d:%d%c%d", &y, &mo, &d, &h, &mi, &s, &sign, &tz) < 6) return false;
+    if (!q || sscanf(q + 1, "%d/%d/%d,%d:%d:%d", &y, &mo, &d, &h, &mi, &s) < 6) return false;
     if (y < 24 || y > 69 || mo < 1 || mo > 12 || d < 1 || d > 31 || h > 23 || mi > 59 || s > 60) return false;
-    *utc = gx5_epoch(2000 + y, mo, d, h, mi, s) - (sign == '-' ? -tz : tz) * 900LL;
+    *utc = gx5_epoch(2000 + y, mo, d, h, mi, s);
     return true;
 }
 
@@ -166,7 +173,8 @@ static inline bool gx5_parse_cclk(const char *line, long long *utc)
 //   ,"lat":-33.86785,"lon":151.20732,"kmh":48.6,"cog":113.48,"sat":9
 // cog = course over ground as the modem gives it (ddd.mm), sat = satellites used.
 // Numbers are re-printed, so a leading zero from the modem cannot break the JSON.
-static inline bool gx5_fix_json(const char *line, char *out, size_t size)
+// *utc (if not NULL) gets the fix time (hhmmss.s + ddmmyy), or 0 if implausible.
+static inline bool gx5_fix_json(const char *line, char *out, size_t size, long long *utc)
 {
     double v[11];
     const char *p = strchr(line, ':');
@@ -178,6 +186,11 @@ static inline bool gx5_fix_json(const char *line, char *out, size_t size)
         v[i] = strtod(p, NULL);
         p += n;
         if (*p != ',' && i < 10) return false;
+    }
+    if (utc) {
+        long t = (long)v[0], d = (long)v[9];
+        int mo = d / 100 % 100, day = d / 10000;
+        *utc = d % 100 >= 24 && mo >= 1 && mo <= 12 && day >= 1 && day <= 31 ? gx5_epoch(2000 + d % 100, mo, day, t / 10000, t / 100 % 100, t % 100) : 0;
     }
     return snprintf(out, size, ",\"lat\":%.5f,\"lon\":%.5f,\"kmh\":%.1f,\"cog\":%.2f,\"sat\":%d", v[1], v[2], v[7], v[6], (int)v[10]) < (int)size;
 }
