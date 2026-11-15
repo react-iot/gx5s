@@ -111,6 +111,9 @@ Status: accepted (2026-11-15)
      modules without the flash-voltage eFuse (see `GX5_MOTION_WAKE` help).
    - **PCF8563**: sets the system clock at boot if valid; rewritten from network
      time (`AT+CCLK?`, `AT+CTZU=1`) on every connect. Telemetry `ts` is 0 until then.
+     Bench 2026-11-16 (`test_rtc_sets_clock`): the Pi sets the RTC 400 days back over
+     the shared bus and the board boots with that time. The write path (network time
+     to RTC) is not tested: it needs a broker connection.
    - **CAN**: see §10.
    - **SD NAND**: offline telemetry queue (`/sd/queue.txt` + offset file). Powered
      and mounted per operation. GPIO2 supplies the NAND directly, so it is driven at

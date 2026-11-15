@@ -145,6 +145,31 @@ def test_external_i2c(hat, con):
     assert {"0x20", "0x40", "0x51", "0x68"} <= set(m[1].split()), m[1]
 
 
+def rtc_write(hat, t):
+    """Set the board's PCF8563 (0x51) to UTC time t, from the Pi over the shared I2C bus."""
+    bcd = lambda v: v // 10 << 4 | v % 10
+    g = time.gmtime(t)
+    hat.bus.write_i2c_block_data(0x51, 0x02, [bcd(g.tm_sec), bcd(g.tm_min), bcd(g.tm_hour), bcd(g.tm_mday),
+                                              (g.tm_wday + 1) % 7, bcd(g.tm_mon), bcd(g.tm_year % 100)])
+
+
+def test_rtc_sets_clock(hat, con):
+    # A time 400 days back can only have come from the RTC (network time needs a broker).
+    back = 400 * 86400
+    rtc_write(hat, int(time.time()) - back)
+    try:
+        con.reset()
+        con.expect(BOOT, 10)
+        hat.acc(True)
+        m = con.expect(r'telemetry \{"ts":(\d+)', 10)
+        off = int(m[1]) - (time.time() - back)  # the RTC kept running since it was set
+        assert abs(off) <= 3, f"clock is {off:.0f} s off the RTC"
+    finally:
+        rtc_write(hat, int(time.time()))  # leave the RTC right
+        hat.acc(False)
+    con.expect(r"ignition off", 5)
+
+
 def test_ignition_on(hat, con):
     hat.acc(True)
     con.expect(r"ignition on", 5)
