@@ -3,3 +3,11 @@
 .venv/
 __pycache__/
 docs/references/SCH_*.pdf
+build/
+sdkconfig
+sdkconfig.old
+managed_components/
+dependencies.lock
+fw/test/test_parse
+fw/test/test_can
+fw/test/test_motion

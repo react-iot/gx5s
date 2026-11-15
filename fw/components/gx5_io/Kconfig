@@ -1,0 +1,28 @@
+menu "GX5s motion wake (MPU-6050)"
+    config GX5_MOTION_WAKE
+        bool "MPU-6050 wakes the device from SLEEP on motion"
+        default y
+        help
+            The IMU stays powered during SLEEP (from the LiPo when one is fitted).
+            APS-INT is the GPIO12 boot strap: if the chip is reset (not woken)
+            while a motion interrupt is latched, a module without the flash
+            voltage eFuse set may fail to boot until power is cycled. Fix once
+            with: espefuse.py set_flash_voltage 3.3V
+    config GX5_MOTION_THRESHOLD
+        int "Motion threshold (MPU-6050 MOT_THR, about 2 mg per step)"
+        depends on GX5_MOTION_WAKE
+        range 1 255
+        default 40
+    config GX5_HARSH_ACCEL_MG
+        int "Harsh acceleration threshold (mg)"
+        default 300
+    config GX5_HARSH_BRAKE_MG
+        int "Harsh braking threshold (mg)"
+        default 400
+    config GX5_HARSH_TURN_MG
+        int "Harsh cornering threshold (mg)"
+        default 400
+        help
+            Driving events are detected while ignition is on, from the gyro and
+            accelerometer together (motion.h). An event must last 0.3 s.
+endmenu

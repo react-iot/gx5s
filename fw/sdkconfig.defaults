@@ -1,0 +1,12 @@
+CONFIG_IDF_TARGET="esp32"
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+
+# Power: 80 MHz is plenty for AT traffic; tickless idle enables auto light sleep.
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_80=y
+CONFIG_PM_ENABLE=y
+CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
+# Shorter awake time on every deep-sleep wake.
+CONFIG_BOOTLOADER_SKIP_VALIDATE_IN_DEEP_SLEEP=y
+CONFIG_BOOTLOADER_LOG_LEVEL_WARN=y
+# on_event() formats JSON and drives I2C on the event task.
+CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096

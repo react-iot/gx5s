@@ -1,0 +1,23 @@
+menu "GX5s board pins"
+    config GX5_MODEM_TX_GPIO
+        int "ESP32 UART TX to the modem"
+        default 23
+    config GX5_MODEM_RX_GPIO
+        int "ESP32 UART RX from the modem"
+        default 22
+    config GX5_CAN_EN_GPIO
+        int "CAN transceiver RS/enable, low = active (-1 = not fitted)"
+        default 0
+        help
+            GPIO0 is also the boot-mode strap; it is only driven after boot.
+    config GX5_EXT_PWR_GPIO
+        int "Harness feed enable EXT-PWR: board runs from the vehicle supply (-1 = not fitted)"
+        default 13
+    config GX5_EXT_PWR_ACTIVE_HIGH
+        bool "EXT-PWR is active high"
+        default n
+        help
+            Enables the 36V->5V buck (TPS5430, via Q2). Off, the board runs
+            from its LiPo (or USB). Measured on the bench: LOW
+            draws from the harness, HIGH does not.
+endmenu

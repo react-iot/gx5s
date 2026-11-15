@@ -1,0 +1,9 @@
+menu "GX5s offline store (SD NAND)"
+    config GX5_STORE
+        bool "Queue telemetry on the SD NAND while offline"
+        default y
+    config GX5_STORE_MAX_KB
+        int "Offline queue size limit (KB)"
+        depends on GX5_STORE
+        default 1024
+endmenu
