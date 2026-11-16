@@ -222,7 +222,10 @@ Status: accepted (2026-11-15)
     address that answers. The bench hat's INA219 (0x40) reaches the bus through the
     harness wiring and serves as the external test device. No driver for any
     particular external sensor yet. The Pi is a second master on that bus during
-    bench runs; no collisions seen, but nothing prevents them.
+    bench runs and nothing prevents collisions. Soak 2026-11-16 (the Pi reading the
+    INA219 11 times a second): 3 of 5 wakes had an `I2C hardware timeout` that dropped
+    the IMU or the RTC for that wake; cause not proven (one coincided with an I2C error
+    on the Pi). Each transfer is now tried three times before a device is dropped.
 
 16. **OTA** (`gx5_modem`). Flash (16 MB): `nvs` 20 K, `otadata`, two app slots of 4 MB and
     a 7.9 MB `storage` data partition, unused today (`fw/partitions.csv`). The table
