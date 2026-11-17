@@ -50,6 +50,11 @@ Status: accepted (2026-11-15)
    `cutoff + GX5_VCC_HYST_MV`. With ignition off, the awake window is always bounded
    (`GX5_CONNECT_TIMEOUT_S`, `GX5_LINGER_S`). A reading below `GX5_VCC_ABSENT_MV`
    means no harness supply (USB / LiPo bench power) and disables protection.
+   The cutoff defaults to 11.0 V, as in GX5sV2 (`vccLow = 11`). It was 11.8 V until
+   the soak of 2026-11-17: with the hat measuring 12.1 V the board read 11.5 V while
+   the LiPo charged (~340 mA) and went to PROTECT with ignition on, then stayed there
+   30 minutes because 12.09 V was under cutoff + hysteresis. Where the ~0.6 V goes is
+   not found yet; until it is, the cutoff acts that much early whenever the charger runs.
 7. **Light sleep while online** needs the modem to announce URCs on RI
    (`urc/ri/other` pulse + `urc/delay`), since UART bytes are lost in light sleep and
    ESP32 UART wake only works on IO_MUX pins. `GX5_LIGHT_SLEEP=n` turns it off.

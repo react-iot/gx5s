@@ -19,10 +19,12 @@ menu "GX5s application"
     menu "Supply protection"
         config GX5_VCC_CUTOFF_MV
             int "Enter PROTECT below this supply voltage (mV)"
-            default 11800
+            default 11000
             help
-                12 V lead-acid at rest: 12.0 V is ~50 %, 11.8 V ~30 %.
-                Use ~23600 for 24 V systems.
+                11 V is what the earlier GX5sV2 firmware used. The board reads up to
+                ~0.6 V below the supply while the LiPo charges, so a cutoff near the
+                resting voltage (12 V lead-acid: 12.0 V is ~50 %, 11.8 V ~30 %) trips
+                on a healthy battery. Use ~22000 for 24 V systems.
         config GX5_VCC_HYST_MV
             int "Leave PROTECT only above cutoff + this (mV)"
             default 400
