@@ -222,6 +222,10 @@ Status: accepted (2026-11-15)
     USB console over RFC2217 (`:4001`) for flashing and for the tests. `setup-pi.sh`
     sets the Pi up once; `test_bench.py` (pytest) checks supply reading, ignition,
     CAN receive, the bounded awake window, sleep current and wake on ignition.
+    `ecu_sim.py` plays an engine ECU on the Pi's `can0` (OBD-II service 01 / 09 / 22
+    with ISO-TP, J1939 requests, broadcasts, TP RTS/CTS and BAM) so `obd2` and `j1939`
+    modes can be exercised without a vehicle; its logic is self-checked
+    (`ecu_sim.py check`), but it has not yet been run against a board.
     Bench results 2026-11-15: a plain divider formula read ~10 % high (13.2-13.6 V at
     12.14 V). The ADC node is a 100K/10K divider loaded by the VCC-detect transistor
     Q4; `gx5_vcc_node_to_mv` now models that circuit from the eFuse-calibrated ADC
