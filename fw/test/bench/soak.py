@@ -5,7 +5,8 @@ can-workbench Pi next to test_bench.py (it reuses the hat driver from there).
     python3 soak.py report              # summary of what has been recorded so far
 
 Writes to ~/gx5s-soak (GX5_SOAK_DIR):
-    samples.csv   one row per second: time, supply V, harness mA, awake (1/0), ignition
+    samples.csv   one row per second: time, supply V, harness mA, awake (1/0), ignition,
+                  LiPo V, LiPo mA (blank without the battery sensor)
     events.csv    boot (wake cause, reset reason, vcc, bat), sleep, fault, ign-on/ign-off
     console.log   every console line, timestamped
 
@@ -13,9 +14,15 @@ The hat keeps VCC on. Ignition is off except for GX5_SOAK_IGN_MIN minutes (10) e
 GX5_SOAK_IGN_EVERY_H hours (6; 0 = never), so both the hourly timer wake and a drive
 are exercised. Times are UTC.
 
-Limits: with USB attached (needed for the console) the board is also fed from USB, so
-the current is the harness share only. The Pi shares the board's I2C bus and reads the
-INA219 ten times a second; a bus clash would show as an I2C error in console.log.
+Battery current: a second INA219 on the Pi's I2C bus, in series with the LiPo positive
+lead (VIN+ to the cell, VIN- to the board), so discharge reads positive and charging
+negative. GX5_BAT_INA is its address (0x41: A0 bridged; the hat's own sensor is 0x40),
+GX5_BAT_SHUNT_OHM its shunt (0.1; read the value off the breakout) and GX5_BAT_MAH the
+cell capacity for the run-time estimate (1000). Without the sensor those columns stay empty.
+
+Limits: with USB attached (needed for the console) a board with D9 fitted is also fed
+from USB, so the harness current is only the harness share. An I2C error on the Pi's bus
+is logged as a pi-i2c-error event.
 """
 import csv
 import os
@@ -28,8 +35,11 @@ DIR = os.path.expanduser(os.environ.get("GX5_SOAK_DIR", "~/gx5s-soak"))
 PORT = os.environ.get("GX5_PORT", "rfc2217://localhost:4001")
 IGN_EVERY_S = float(os.environ.get("GX5_SOAK_IGN_EVERY_H", "6")) * 3600
 IGN_S = float(os.environ.get("GX5_SOAK_IGN_MIN", "10")) * 60
+BAT_INA = int(os.environ.get("GX5_BAT_INA", "0x41"), 0)
+BAT_SHUNT_OHM = float(os.environ.get("GX5_BAT_SHUNT_OHM", "0.1"))
+BAT_MAH = float(os.environ.get("GX5_BAT_MAH", "1000"))
 BOOT = re.compile(r"gx5: id=[\w:]+ wake=([\w-]+) ign=(\d) vcc=(\d+) mV bat=(\d+) mV rst=(\d+)")
-SLEEP = re.compile(r"gx5: (SLEEP|PROTECT): vcc=(\d+) mV bat=(\d+) mV")
+SLEEP = re.compile(r"gx5: (SLEEP|PROTECT|HIBERNATE): vcc=(\d+) mV bat=(\d+) mV")
 FAULT = re.compile(r"Guru Meditation|abort\(\) was called|Backtrace:|[Bb]rownout|task_wdt|assert failed|ESP_ERROR_CHECK failed|stack overflow")
 RST = ["unknown", "power-on", "ext", "sw", "panic", "int-wdt", "task-wdt", "wdt", "deep-sleep", "brownout"]  # esp_reset_reason_t
 EVENT_COLS = ["time", "epoch", "event", "wake", "ign", "vcc_mv", "bat_mv", "rst", "note"]
@@ -48,6 +58,18 @@ def open_csv(name, header):
     if new:
         w.writerow(header)
     return w
+
+
+def ina_word(bus, addr, reg):
+    v = bus.read_word_data(addr, reg)
+    return ((v & 0xFF) << 8) | (v >> 8)  # INA219 is big-endian
+
+
+def bat_read(bus):
+    """LiPo volts and mA (+ = discharging) from the battery INA219."""
+    raw = ina_word(bus, BAT_INA, 1)  # shunt voltage, 10 uV per bit, signed
+    raw = raw - 0x10000 if raw & 0x8000 else raw
+    return (ina_word(bus, BAT_INA, 2) >> 3) * 0.004, raw * 1e-5 / BAT_SHUNT_OHM * 1000
 
 
 def console(events):
@@ -89,12 +111,18 @@ def run():
 
     os.makedirs(DIR, exist_ok=True)
     events = open_csv("events.csv", EVENT_COLS)
-    samples = open_csv("samples.csv", ["time", "epoch", "volts", "ma", "awake", "ign"])
+    samples = open_csv("samples.csv", ["time", "epoch", "volts", "ma", "awake", "ign", "bat_v", "bat_ma"])
     rig = lambda what: events.writerow([now(), int(time.time()), what, "", "", "", "", "", ""])
     hat = Hat()
     hat.acc(False)
     hat.vcc(True)
     rig("soak-start")
+    try:  # 128-sample averaging (68 ms per reading): sleep current is a fraction of a mA
+        hat.bus.write_word_data(BAT_INA, 0, 0xFF3F)  # config 0x3FFF, big-endian on the wire
+        bat = True
+    except OSError:
+        bat = False
+    rig(f"battery sensor at {BAT_INA:#x}, shunt {BAT_SHUNT_OHM} ohm" if bat else f"no battery sensor at {BAT_INA:#x}")
     threading.Thread(target=console, args=(events,), daemon=True).start()
 
     start, ign, errors = time.time(), False, 0
@@ -106,7 +134,11 @@ def run():
             hat.acc(ign)
             rig("ign-on" if ign else "ign-off")
         try:
-            samples.writerow([now(), f"{t:.1f}", f"{hat.volts():.2f}", f"{hat.milliamps(10):.2f}", awake, int(ign)])
+            row = [now(), f"{t:.1f}", f"{hat.volts():.2f}", f"{hat.milliamps(10):.2f}", awake, int(ign)]
+            if bat:
+                v, ma = bat_read(hat.bus)
+                row += [f"{v:.3f}", f"{ma:.2f}"]
+            samples.writerow(row)
         except OSError as e:  # the board is the other master on this bus
             errors += 1
             if errors in (1, 10, 100, 1000):
@@ -132,7 +164,7 @@ def report():
 
     up, down, last = [], [], None  # awake and asleep stretches, seconds
     for e in ev:
-        if e["event"] in ("boot", "sleep", "protect"):
+        if e["event"] in ("boot", "sleep", "protect", "hibernate"):
             if last and last["event"] == "boot" and e["event"] != "boot":
                 up.append(int(e["epoch"]) - int(last["epoch"]))
             if last and last["event"] != "boot" and e["event"] == "boot":
@@ -156,7 +188,7 @@ def report():
               (f", trend {(bat[-1] - bat[0]) / days:+.0f} mV/day" if days > 0.5 else ""))
         drops, prev = [], None  # (mV lost, hours asleep) for each sleep -> wake pair
         for e in ev:
-            if e["event"] == "sleep":
+            if e["event"] in ("sleep", "hibernate"):
                 prev = e
             elif e["event"] == "boot" and prev and e["rst"] == "deep-sleep":
                 h = (int(e["epoch"]) - int(prev["epoch"])) / 3600
@@ -179,11 +211,18 @@ def report():
 
     tot = {"1": [0.0, 0], "0": [0.0, 0], "": [0.0, 0]}
     peak = {"1": 0.0, "0": 0.0, "": 0.0}
+    btot = {"1": [0.0, 0], "0": [0.0, 0], "": [0.0, 0]}  # LiPo mA, + = discharging
+    bpeak = {"1": 0.0, "0": 0.0, "": 0.0}
     for r in csv.DictReader(open(os.path.join(DIR, "samples.csv"))):
         ma = float(r["ma"])
         tot[r["awake"]][0] += ma
         tot[r["awake"]][1] += 1
         peak[r["awake"]] = max(peak[r["awake"]], ma)
+        if r.get("bat_ma"):
+            b = float(r["bat_ma"])
+            btot[r["awake"]][0] += b
+            btot[r["awake"]][1] += 1
+            bpeak[r["awake"]] = max(bpeak[r["awake"]], b)
     n = sum(v[1] for v in tot.values())
     print(f"\nharness current over {n / 3600:.1f} h of samples (1 per second):")
     for key, name in (("1", "awake"), ("0", "asleep"), ("", "unknown")):
@@ -192,6 +231,22 @@ def report():
             print(f"  {name:8s} {c / n * 100:5.1f} % of the time, avg {s / c:7.2f} mA, peak {peak[key]:7.1f} mA")
     mah = sum(v[0] for v in tot.values()) / 3600
     print(f"  total {mah:.1f} mAh, average {mah / (n / 3600):.2f} mA" if n else "  no samples")
+
+    bn = sum(v[1] for v in btot.values())
+    if not bn:
+        print("\nLiPo current: no battery sensor samples")
+        return
+    print(f"\nLiPo current over {bn / 3600:.1f} h of samples (+ = discharging, - = charging):")
+    for key, name in (("1", "awake"), ("0", "asleep"), ("", "unknown")):
+        s, c = btot[key]
+        if c:
+            print(f"  {name:8s} avg {s / c:8.2f} mA, peak discharge {bpeak[key]:7.1f} mA")
+    net = sum(v[0] for v in btot.values()) / 3600
+    print(f"  net {net:+.1f} mAh taken from the LiPo, average {net / (bn / 3600):+.2f} mA")
+    s, c = btot["0"]
+    if c and s / c > 0:
+        h = BAT_MAH / (s / c)
+        print(f"  asleep on the LiPo alone: a {BAT_MAH:.0f} mAh cell lasts about {h:.0f} h ({h / 24:.1f} days), wakes not counted")
 
 
 if __name__ == "__main__":

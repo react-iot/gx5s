@@ -36,7 +36,7 @@ Components do not call each other; only `main` wires them together.
 | Topic | Direction | Payload |
 |---|---|---|
 | `discovery/<mac>` (`<mac>` = device id `AA:BB:CC:DD:EE:FF`, factory MAC + 3) | device → bootstrap broker | `{"id":"<mac>","hw":"<product>","fw":"<ver>","reason":"unprovisioned"}` (or `broker-unreachable`) |
-| `device/<mac>/<loc>/status/connected` | device → broker, retained | `online`, `provisioning`, `sleep`, `protect`, `offline` (last will) |
+| `device/<mac>/<loc>/status/connected` | device → broker, retained | `online`, `provisioning`, `sleep`, `hibernate`, `protect`, `offline` (last will) |
 | `device/<mac>/<loc>/event` | device → broker | `{"id","fw","reason":"broker-changed"}` or `broker-change-failed`; driving events `{"ts":…,"ev":"brake","mg":520}` (`accel`, `brake`, `left`, `right`, `harsh`) |
 | `device/<mac>/<loc>/telemetry` | device → broker | `{"ts":1794745845,"ign":1,"vcc_mv":12850,"bat_mv":4100,"ext":1,"chg":0,"can":1532,"wake":"timer","up_s":42,"acc":[12,-30,1004],"temp":31.5,"gyro":[0.4,-1.2,0.1],"lat":-33.86785,"lon":151.20732,"kmh":48.6,"cog":113.48,"sat":9}` |
 | `device/<mac>/<loc>/can` | device → broker | changed CAN values: `{"ts":…,"obd":["7E8 01 0C 1AF8"]}` or `{"ts":…,"j1939":["FEEE 00 8C7DFFFFFFFFFFFF"]}` |
@@ -100,6 +100,9 @@ blinks five times and the device announces itself for provisioning again.
 - **Ignition off** — connect, report, stay `GX5_LINGER_S`, then deep sleep with the modem still
   registered. Wakes on ignition, motion (MPU-6050), modem RI (e.g. an SMS) or every `GX5_HEARTBEAT_S`; commands
   sent meanwhile are queued by the broker (persistent session).
+- **Hibernate** (`GX5_HIBERNATE=y`, off by default) — as ignition off, but the modem is powered
+  down while asleep: nothing can reach the device until ignition, motion or the heartbeat timer
+  wakes it, and each wake starts the modem and registers again.
 - **Offline** — telemetry is queued on the SD NAND with an RTC timestamp and replayed when the broker is back.
 - **Supply below `GX5_VCC_CUTOFF_MV`** — modem powered down, deep sleep, supply re-measured every
   `GX5_PROTECT_RECHECK_S`; resumes above cutoff + `GX5_VCC_HYST_MV`.
@@ -117,6 +120,8 @@ Long runs: `soak.py` on the same Pi logs the supply current once a second and ev
 (wake cause, reset reason), sleep and fault from the console to `~/gx5s-soak`, with a
 10-minute ignition cycle every 6 hours. `sudo systemctl start gx5s-soak` starts it,
 `python3 soak.py report` summarises; stop it before running pytest (both drive the hat).
+With a second INA219 at `0x41` on the Pi's I2C bus, in series with the LiPo positive lead,
+it also logs LiPo voltage and current and reports the drain while asleep.
 
 ```sh
 scp test/bench/* can-workbench:gx5s-bench/
