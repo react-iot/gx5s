@@ -55,6 +55,9 @@ Status: accepted (2026-11-15)
    the LiPo charged (~340 mA) and went to PROTECT with ignition on, then stayed there
    30 minutes because 12.09 V was under cutoff + hysteresis. Where the ~0.6 V goes is
    not found yet; until it is, the cutoff acts that much early whenever the charger runs.
+   The same run showed the charger switching every 5 s tick (on: reading under the
+   cutoff; off: reading back above it), so it now stops below the cutoff and starts
+   again only above cutoff + hysteresis. Not yet run on hardware.
 7. **Light sleep while online** needs the modem to announce URCs on RI
    (`urc/ri/other` pulse + `urc/delay`), since UART bytes are lost in light sleep and
    ESP32 UART wake only works on IO_MUX pins. `GX5_LIGHT_SLEEP=n` turns it off.

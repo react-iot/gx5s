@@ -415,7 +415,12 @@ static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         int mv = vcc_mv();
         s_low_count = supply_low(mv) ? s_low_count + 1 : 0;
         if (!s_low_count) s_protect = false; // recovered past the hysteresis
-        gx5_exp_set(GX5_EXP_CHRG_EN, mv >= CONFIG_GX5_VCC_CUTOFF_MV); // charge the LiPo only from a healthy supply
+        // Charge the LiPo only from a healthy supply. Charging pulls the reading down, so
+        // it starts only above the hysteresis: without it the charger switched every tick.
+        static bool chg;
+        if (mv < CONFIG_GX5_VCC_CUTOFF_MV) chg = false;
+        else if (mv >= CONFIG_GX5_VCC_CUTOFF_MV + CONFIG_GX5_VCC_HYST_MV) chg = true;
+        gx5_exp_set(GX5_EXP_CHRG_EN, chg);
         if (s_low_count >= 3) deep_sleep(true);               // 3 in a row: rides through cranking dips
         break;
     }
