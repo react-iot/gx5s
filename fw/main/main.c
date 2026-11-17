@@ -47,6 +47,11 @@
 #else
 #define MOTION_WAKE false
 #endif
+#ifdef CONFIG_GX5_HIBERNATE
+#define HIBERNATE true
+#else
+#define HIBERNATE false
+#endif
 
 static const char *TAG = "gx5";
 
@@ -101,6 +106,7 @@ static void hold(int pin, int level)
 }
 
 // SLEEP: modem stays registered, RI/ignition/heartbeat wake us.
+// HIBERNATE (GX5_HIBERNATE): the same sleep with the modem off, so no RI wake.
 // PROTECT: modem off, only ignition (if currently off) and a recheck timer wake us.
 // ── Factory reset: five fast resets ─────────────────────────────────────────
 // Five resets in a row (reset button or power cycle), each within about 5 s of the
@@ -157,10 +163,11 @@ static void deep_sleep(bool protect)
     // the MCU browns out, the buck's enable floats back on and the board reboots in a loop.
     int bat = bat_mv();
     bool feed = bat < CONFIG_GX5_BAT_MIN_MV;
-    ESP_LOGW(TAG, "%s: vcc=%d mV bat=%d mV ign=%d feed=%d", protect ? "PROTECT" : "SLEEP", vcc_mv(), bat, s_ign, feed);
+    bool off = protect || HIBERNATE; // modem powered down for this sleep
+    ESP_LOGW(TAG, "%s: vcc=%d mV bat=%d mV ign=%d feed=%d", protect ? "PROTECT" : off ? "HIBERNATE" : "SLEEP", vcc_mv(), bat, s_ign, feed);
     if (!s_connected && !protect) store_telemetry(); // an offline heartbeat still leaves a record
-    gx5_mqtt_publish("status/connected", protect ? "protect" : "sleep", true);
-    gx5_modem_stop(protect);
+    gx5_mqtt_publish("status/connected", protect ? "protect" : off ? "hibernate" : "sleep", true);
+    gx5_modem_stop(off);
     gx5_exp_set(GX5_EXP_GSM_SLP, true); // DTR high: the modem may now sleep; low again at boot (expander init)
     gx5_can_stop();
     s_protect = protect;
@@ -185,7 +192,7 @@ static void deep_sleep(bool protect)
     gpio_wakeup_disable(GX5_PIN_GSM_INT);
     esp_sleep_enable_ext0_wakeup(GX5_PIN_ACC_INT, ignition() ? 1 : 0); // next ignition change
     if (!protect) {
-        int pins[] = {GX5_PIN_GSM_INT, MOTION_WAKE ? GX5_PIN_APS_INT : -1};
+        int pins[] = {off ? -1 : GX5_PIN_GSM_INT, MOTION_WAKE ? GX5_PIN_APS_INT : -1}; // no RI from a modem that is off
         uint64_t mask = 0;
         for (int i = 0; i < 2; i++) {
             if (pins[i] < 0) continue;

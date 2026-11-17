@@ -60,6 +60,18 @@ menu "GX5s application"
         config GX5_HEARTBEAT_S
             int "Ignition off: wake and report every (s)"
             default 3600
+        config GX5_HIBERNATE
+            bool "Ignition off: power the modem down while asleep (hibernate)"
+            default n
+            help
+                Off (standby): the modem sleeps but stays registered, so an
+                SMS or a queued command can wake the device, and a wake
+                reconnects in seconds.
+                On (hibernate): the modem is powered down for every
+                ignition-off sleep. Lowest drain, but the device cannot be
+                reached until it wakes by itself (ignition, motion or the
+                heartbeat timer), and every wake pays a modem start and
+                network registration.
         config GX5_TELEMETRY_S
             int "Ignition on: publish telemetry every (s)"
             default 60

@@ -30,9 +30,10 @@ Status: accepted (2026-11-15)
    | RUN | 80 MHz + auto light sleep | MQTT connected | ignition on | — |
    | LINGER | same | MQTT connected | ignition off / timer or RI wake | — |
    | SLEEP | deep sleep | registered, `QSCLK=1`, GNSS off | linger or connect timeout expired | ignition (ext0), RI or motion (ext1), heartbeat timer |
+   | HIBERNATE | deep sleep | powered down (`QPOWD`) | as SLEEP, when `GX5_HIBERNATE=y` | ignition (ext0), motion (ext1), heartbeat timer |
    | PROTECT | deep sleep | powered down (`QPOWD`) | supply below cutoff | ignition (only if off), recheck timer |
 
-   In both sleep states the regulator is in power-save mode, the charger is off and
+   In all sleep states the regulator is in power-save mode, the charger is off and
    the harness feed is off, so the board lives on its LiPo and draws ~0.15 mA from
    the vehicle (11.4 mA with feed and normal mode left on). The feed stays on
    (6.6 mA) only when the LiPo is below `GX5_BAT_MIN_MV` or missing: with neither
