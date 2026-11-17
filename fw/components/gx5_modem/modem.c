@@ -20,6 +20,9 @@
 #include "gx5_modem.h"
 
 #define UART     UART_NUM_1
+// +QMTDISC: once took longer than 5 s on the bench (2026-11-17). Giving up early
+// leaves the session open and the late URC wakes the board right after it sleeps.
+#define DISC_MS  15000
 #define LINE_LEN 640 // +QMTRECV line: topic + a 511-byte payload
 #define AT(cmd)  at(cmd, NULL, NULL, NULL, 2000)
 #define STR_(x)  #x
@@ -123,7 +126,7 @@ static bool read_line(char *buf, size_t size, TickType_t deadline)
 // Send cmd. Succeeds once "OK" and (if given) a line starting with `expect` have
 // both arrived, in either order; that line is copied to `out` (LINE_LEN) if set.
 // `payload` is written at the '>' prompt. Unrelated lines are handled as URCs.
-static bool at(const char *cmd, const char *expect, char *out, const char *payload, int timeout_ms)
+static bool at_awake(const char *cmd, const char *expect, char *out, const char *payload, int timeout_ms)
 {
     char line[LINE_LEN];
     TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
@@ -150,6 +153,16 @@ static bool at(const char *cmd, const char *expect, char *out, const char *paylo
     }
     ESP_LOGW(TAG, "%.*s -> no response", name, cmd);
     return false;
+}
+
+// One command and its reply. UART bytes are lost in light sleep, so the MCU stays
+// awake for the whole exchange whoever calls (the lock counts, nesting is fine).
+static bool at(const char *cmd, const char *expect, char *out, const char *payload, int timeout_ms)
+{
+    esp_pm_lock_acquire(s_awake);
+    bool ok = at_awake(cmd, expect, out, payload, timeout_ms);
+    esp_pm_lock_release(s_awake);
+    return ok;
 }
 
 static bool sync_at(int tries)
@@ -213,11 +226,22 @@ static bool mqtt_connect(const gx5_broker_t *b)
     char cmd[256], line[LINE_LEN];
     int result = -1;
 
+    // A socket left open from before sleep: opening over it fails with "client identifier
+    // occupied" (+QMTOPEN: 0,2), so wait for the close to finish. ERROR = nothing open.
+    at("AT+QMTCLOSE=0", "+QMTCLOSE:", NULL, NULL, 5000);
+
     AT("AT+QMTCFG=\"version\",0,4"); // MQTT 3.1.1
     AT("AT+QMTCFG=\"pdpcid\",0,1");
     AT("AT+QMTCFG=\"keepalive\",0," STR(CONFIG_GX5_MQTT_KEEPALIVE_S));
     AT("AT+QMTCFG=\"session\",0,0"); // persistent: broker queues QoS1 cmds while we sleep
-    snprintf(cmd, sizeof cmd, "AT+QMTCFG=\"will\",0,1,1,1,\"device/%s/%s/status/connected\",\"offline\"", s_id, s_loc);
+    // Unprovisioned, the broker allows discovery/<id> and nothing else: no last will.
+    // The will is first set with QoS 0 / no retain, then switched off. Switching it off
+    // alone made the broker drop the CONNECT unanswered (bench 2026-11-16); probably the
+    // modem kept the earlier will QoS and retain bits, which MQTT forbids without a will.
+    if (b == &s_boot) {
+        AT("AT+QMTCFG=\"will\",0,1,0,0,\"x\",\"x\"");
+        strcpy(cmd, "AT+QMTCFG=\"will\",0,0");
+    } else snprintf(cmd, sizeof cmd, "AT+QMTCFG=\"will\",0,1,1,1,\"device/%s/%s/status/connected\",\"offline\"", s_id, s_loc);
     AT(cmd);
     if (b->tls) {
         AT("AT+QSSLCFG=\"seclevel\",0," STR(CONFIG_GX5_MQTT_TLS_SECLEVEL));
@@ -226,7 +250,6 @@ static bool mqtt_connect(const gx5_broker_t *b)
     } else {
         AT("AT+QMTCFG=\"ssl\",0,0");
     }
-    at("AT+QMTCLOSE=0", NULL, NULL, NULL, 2000); // stale socket from before sleep; may fail
 
     snprintf(cmd, sizeof cmd, "AT+QMTOPEN=0,\"%s\",%d", b->host, b->port);
     if (!at(cmd, "+QMTOPEN:", line, NULL, 75000) || gx5_last_int(line) != 0) {
@@ -241,8 +264,12 @@ static bool mqtt_connect(const gx5_broker_t *b)
         ESP_LOGE(TAG, "broker rejected connect: %s", line);
         return false;
     }
-    // Commands: device/<id> (this device) and location/<location> (every device there).
     // +QMTSUB: <client>,<msgid>,<result>,<value>
+    if (b == &s_boot) { // the login arrives on the topic we announce on
+        snprintf(cmd, sizeof cmd, "AT+QMTSUB=0,1,\"discovery/%s\",1", s_id);
+        return at(cmd, "+QMTSUB:", line, NULL, 15000) && sscanf(line, "+QMTSUB: %*d,%*d,%d", &result) == 1 && result == 0;
+    }
+    // Commands: device/<id> (this device) and location/<location> (every device there).
     snprintf(cmd, sizeof cmd, "AT+QMTSUB=0,1,\"device/%s\",1", s_id);
     if (!at(cmd, "+QMTSUB:", line, NULL, 15000) || sscanf(line, "+QMTSUB: %*d,%*d,%d", &result) != 1 || result) return false;
     snprintf(cmd, sizeof cmd, "AT+QMTSUB=0,2,\"location/%s\",1", s_loc);
@@ -401,6 +428,9 @@ static int wait_any(msg_t *m, TickType_t ticks)
     return 0;
 }
 
+static const char *why_here(void);
+static void announce(const char *reason);
+
 // Connected: sleep until the modem (RI pulse / UART) or the app wants something.
 static void serve(void)
 {
@@ -423,6 +453,8 @@ static void serve(void)
         }
         if (w == 'u') {
             while (read_line(line, sizeof line, xTaskGetTickCount() + pdMS_TO_TICKS(100))) urc(line);
+        } else if (m.type == M_PUB && s_provisioning) {
+            announce(why_here()); // telemetry tick: still here, still waiting for a login
         } else if (m.type == M_PUB) {
             char topic[96];
             full_topic(topic, sizeof topic, m.topic);
@@ -457,7 +489,7 @@ static void park(void)
         if (!sync_at(2)) ESP_LOGI(TAG, "modem already off");
         else if (!at("AT+QPOWD=1", "POWERED DOWN", NULL, NULL, 10000)) ESP_LOGE(TAG, "modem did not confirm power down");
     } else {
-        if (s_session) at("AT+QMTDISC=0", "+QMTDISC:", NULL, NULL, 5000); // never connected: no URC comes, 5 s wasted
+        if (s_session) at("AT+QMTDISC=0", "+QMTDISC:", NULL, NULL, DISC_MS); // never connected: no URC comes, time wasted
         s_session = false;
         AT("AT+QGPSEND");                                   // GNSS off, or the modem never sleeps
         AT("AT+QSCLK=1");                                   // modem sleeps when idle, stays registered
@@ -483,6 +515,8 @@ static void load_broker(void)
     nvs_close(h);
 }
 
+static const char *why_here(void) { return s_have_stored ? "broker-unreachable" : "unprovisioned"; }
+
 // Tell whoever runs this broker who we are and why we are here:
 // discovery/<id> on the bootstrap broker, device/<id>/<location>/event otherwise.
 static void announce(const char *reason)
@@ -491,7 +525,7 @@ static void announce(const char *reason)
     char topic[96];
     if (s_provisioning) snprintf(topic, sizeof topic, "discovery/%s", s_id);
     else full_topic(topic, sizeof topic, "event");
-    snprintf(m.data, sizeof m.data, "{\"id\":\"%s\",\"fw\":\"%s\",\"reason\":\"%s\"}", s_id, esp_app_get_description()->version, reason);
+    snprintf(m.data, sizeof m.data, "{\"id\":\"%s\",\"hw\":\"" CONFIG_GX5_PRODUCT_ID "\",\"fw\":\"%s\",\"reason\":\"%s\"}", s_id, esp_app_get_description()->version, reason);
     publish(topic, &m);
 }
 
@@ -510,6 +544,11 @@ static void modem_task(void *arg)
             if (s_loc_dirty) load_loc();
             esp_pm_lock_acquire(s_awake);
             s_abortable = true;
+            // Reconnecting with a session still open (a login arrived, the broker changed):
+            // end it before bringup() drops the data context under it. After that the modem
+            // refuses DISC, never finishes CLOSE, and the next open fails (bench 2026-11-17).
+            if (s_session) at("AT+QMTDISC=0", "+QMTDISC:", NULL, NULL, DISC_MS);
+            s_session = false;
             bool net = bringup(); // the network comes first: no broker is reachable without it
             ESP_LOGI(TAG, "network %s", net ? "up" : "down");
             if (net) {
@@ -549,7 +588,7 @@ static void modem_task(void *arg)
                 s_provisioning = b == &s_boot;
                 s_connected = s_session = true;
                 if (note) announce(note);
-                else if (s_provisioning) announce(s_have_stored ? "broker-unreachable" : "unprovisioned");
+                else if (s_provisioning) announce(why_here());
                 note = NULL;
                 esp_event_post(GX5_EVENT, GX5_EV_MQTT_CONNECTED, NULL, 0, portMAX_DELAY);
                 serve();
@@ -584,6 +623,9 @@ bool gx5_mqtt_publish(const char *subtopic, const char *payload, bool retain)
 {
     msg_t m = {.type = M_PUB, .retain = retain};
     if (!s_connected) return false;
+    // Unprovisioned, only discovery/<id> may be published: each telemetry tick becomes
+    // a repeat of the announcement (serve) and everything else is dropped.
+    if (s_provisioning && strcmp(subtopic, "telemetry")) return false;
     strlcpy(m.topic, subtopic, sizeof m.topic);
     strlcpy(m.data, payload, sizeof m.data);
     return xQueueSend(s_msgq, &m, pdMS_TO_TICKS(2000)) == pdTRUE; // brief wait rides out a burst
@@ -604,6 +646,11 @@ void gx5_broker_set(const gx5_broker_t *b)
 {
     msg_t m = {.type = M_RECONNECT};
     s_cand = *b;
+    if (!s_cand.host[0]) { // a login only: it is for the bootstrap broker itself
+        strcpy(s_cand.host, s_boot.host);
+        s_cand.port = s_boot.port;
+        s_cand.tls = s_boot.tls;
+    }
     s_have_cand = true; // set last: the modem task reads s_cand only after this
     xQueueSend(s_msgq, &m, pdMS_TO_TICKS(1000));
 }

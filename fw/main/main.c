@@ -318,6 +318,16 @@ static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         gx5_broker_t b;
         char ext[GX5_EXT_LINE];
         bool is_prov;
+        char loc0[GX5_LOC_LEN];
+        if (!strncmp(m->topic, "discovery/", 10)) { // unprovisioned: only a login matters (our own announcement echoes here too)
+            if (gx5_parse_login(m->data, &b, loc0)) {
+                ESP_LOGI(TAG, "login received, location %s", loc0);
+                gx5_location_set(loc0, false);
+                apply_ignition(); // ignition off: fresh connect window to try it
+                gx5_broker_set(&b);
+            }
+            break;
+        }
         const char *prov = gx5_provision(m->data, s_pop, &is_prov);
         if (is_prov || gx5_parse_broker(m->data, &b)) {
             // The broker only ever changes through {"provision":{"pop":..}} with this device's PIN.

@@ -67,7 +67,7 @@ Components do not call each other; only `main` wires them together.
 
 | Topic | Direction | Payload |
 |---|---|---|
-| `discovery/<mac>` (`<mac>` = device id `AA:BB:CC:DD:EE:FF`, factory MAC + 3) | device → bootstrap broker | `{"id":"<mac>","fw":"<ver>","reason":"unprovisioned"}` (or `broker-unreachable`) |
+| `discovery/<mac>` (`<mac>` = device id `AA:BB:CC:DD:EE:FF`, factory MAC + 3) | device → bootstrap broker | `{"id":"<mac>","hw":"<product>","fw":"<ver>","reason":"unprovisioned"}` (or `broker-unreachable`) |
 | `device/<mac>/<loc>/status/connected` | device → broker, retained | `online`, `provisioning`, `sleep`, `protect`, `offline` (last will) |
 | `device/<mac>/<loc>/event` | device → broker | `{"id","fw","reason":"broker-changed"}` or `broker-change-failed`; driving events `{"ts":…,"ev":"brake","mg":520}` (`accel`, `brake`, `left`, `right`, `harsh`) |
 | `device/<mac>/<loc>/telemetry` | device → broker | `{"ts":1794745845,"ign":1,"vcc_mv":12850,"bat_mv":4100,"ext":1,"chg":0,"can":1532,"wake":"timer","up_s":42,"acc":[12,-30,1004],"temp":31.5,"gyro":[0.4,-1.2,0.1],"lat":-33.86785,"lon":151.20732,"kmh":48.6,"cog":113.48,"sat":9}` |
@@ -87,6 +87,12 @@ tries the new broker immediately and stores it only if it connects; with a wrong
 nothing and publishes `provision-rejected`. The same message on the production broker moves the
 device again. After `GX5_PROVISION_AFTER_FAILS` failed connects it checks
 back with the bootstrap broker. `idf.py erase-flash` returns a device to unprovisioned.
+
+On the React IoT broker the login comes on the announcement topic instead: the device
+subscribes `discovery/<mac>` and takes
+`{"cmd":"config","location":"0001","user":"<mac>","pass":"<secret>"}`, then reconnects to the
+same broker with that username and password. Until then it publishes nothing but the
+announcement.
 
 Firmware update: `{"cmd":"ota","version":"1.4.2"}` (no version = `latest`) on a command topic.
 The modem fetches `<GX5_OTA_URL>/fw/<hardware id>-<version>.bin` (default

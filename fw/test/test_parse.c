@@ -67,6 +67,13 @@ int main(void)
     assert(!strcmp(pop, "14720943"));
     gx5_pop((const uint8_t[]){0xC4, 0xDD, 0x57, 0x00, 0x00, 0x2A}, pop);
     assert(!strcmp(pop, "00000042")); // always 8 digits
+    char lloc[GX5_LOC_LEN];
+    assert(gx5_parse_login("{\"cmd\":\"config\",\"site\":\"s1\",\"location\":\"0001\",\"user\":\"C4:DD:57:E1:EE:FB\",\"pass\":\"0123456789012345678901234567890123456789012\"}", &br, lloc));
+    assert(!strcmp(lloc, "0001") && !strcmp(br.user, "C4:DD:57:E1:EE:FB") && strlen(br.pass) == 43 && !br.host[0]);
+    assert(!gx5_parse_login("{\"id\":\"C4:DD:57:E1:EE:FB\",\"fw\":\"1\",\"reason\":\"unprovisioned\"}", &br, lloc)); // our own announcement
+    assert(!gx5_parse_login("{\"cmd\":\"config\",\"location\":\"0001\",\"user\":\"u\"}", &br, lloc));            // no secret
+    assert(!gx5_parse_login("{\"cmd\":\"config\",\"user\":\"u\",\"pass\":\"p\"}", &br, lloc));                  // no location
+    assert(!gx5_parse_login("{\"cmd\":\"ota\",\"location\":\"0001\",\"user\":\"u\",\"pass\":\"p\"}", &br, lloc));
     const char *pm = "{\"provision\":{\"pop\":\"00000042\",\"broker\":{\"host\":\"mq.example.com\"},\"config\":{\"can\":{\"mode\":\"obd2\"}}}}";
     const char *po = gx5_provision(pm, pop, &isp);
     assert(po && isp && gx5_parse_broker(po, &br) && !strcmp(br.host, "mq.example.com") && gx5_json_val(po, "config"));

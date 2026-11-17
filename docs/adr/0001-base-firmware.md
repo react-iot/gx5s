@@ -52,6 +52,12 @@ Status: accepted (2026-11-15)
 7. **Light sleep while online** needs the modem to announce URCs on RI
    (`urc/ri/other` pulse + `urc/delay`), since UART bytes are lost in light sleep and
    ESP32 UART wake only works on IO_MUX pins. `GX5_LIGHT_SLEEP=n` turns it off.
+   Every modem command holds the no-light-sleep lock for its whole exchange (in `at()`
+   itself, not in the callers). Bench 2026-11-17: the announcement sent right after
+   connecting ran without the lock; with ignition off (CAN is off, so nothing else holds
+   one) the MCU slept between the modem's `OK` and its `+QMTPUB:`, lost that reply and
+   every incoming message, declared the link dead and reconnected, which the broker
+   logged as "Duplicate Client ID". With ignition on, CAN's lock hid it.
 8. **Provisioning.** The broker is not compiled in. Firmware carries only a
    *bootstrap* broker (menuconfig; default `mqtt.reactiot.com.au:1883`, no TLS, so the
    provisioning message and the credentials in it travel unencrypted). Selection each connect: candidate > stored (NVS
@@ -79,6 +85,32 @@ Status: accepted (2026-11-15)
      succeeds**; otherwise the device returns to the broker it came from and
      publishes `event` `broker-change-failed`. Messages may be up to 511 bytes.
    - The same message on the production broker re-provisions.
+   - **Login on the bootstrap broker itself** (the `mqtt.reactiot.com.au` broker,
+     2026-11-16). That broker lets an anonymous device use `discovery/<id>` and nothing
+     else, so on the bootstrap broker the firmware sets no last will, subscribes only
+     `discovery/<id>`, publishes nothing but the announcement
+     (`{"id","hw","fw","reason"}`, repeated on every telemetry tick) and drops the rest.
+     The answer comes on the same topic:
+     `{"cmd":"config","location":"0001","user":"<id>","pass":"<secret>"}`. Location,
+     user and password are all required; a `site` is ignored (no site id in the topics).
+     The device keeps host, port and TLS of the bootstrap broker, tries the login at
+     once and stores it only if it connects. No PIN: the broker only lets the owner of
+     a client id read `discovery/<id>`, and the client id is self-asserted, so anyone
+     connecting as a device's id could read its secret. Bench 2026-11-16: the anonymous connect and the
+     `discovery/<id>` subscription work (`MQTT connected … (bootstrap)`). Switching the
+     will off needs two steps (set it with QoS 0 / no retain, then off): switched off
+     alone, the broker dropped the CONNECT unanswered. Bench 2026-11-17 (ignition off):
+     the board announced, took the login, disconnected, connected with it
+     (`MQTT connected to mqtt.reactiot.com.au`, no `(bootstrap)`) and after a reset
+     connected with the stored login directly. Two faults had to go first:
+     - A reconnect with a session still open (the login arriving is one) must send
+       `AT+QMTDISC` **before** `bringup()`, which resets the data context
+       (`AT+QIDEACT`). After the reset the modem answers DISC with ERROR, never finishes
+       `AT+QMTCLOSE`, and refuses the next open with `+QMTOPEN: 0,2` (client identifier
+       occupied); the login was then dropped as "new broker unreachable".
+     - DISC waits 15 s for `+QMTDISC:`, not 5 s. Once the 5 s wait gave up at sleep time
+       and the board woke again 2 s later with `wake=modem`. Confirmations measured
+       since: 1.4 to 2.3 s.
    - The PIN is derived from the id the device announces, so it stops mistakes
      (provisioning the wrong unit), not an attacker who can read `discovery/#`.
    - `GX5_PROVISION_AFTER_FAILS` consecutive failures to reach the stored broker

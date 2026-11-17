@@ -146,6 +146,19 @@ static inline bool gx5_parse_broker(const char *js, gx5_broker_t *b)
     return true;
 }
 
+// {"cmd":"config","location":"0001","user":"<id>","pass":"<secret>"}: the login for the
+// bootstrap broker, sent on discovery/<id>. All three are required; any "site" is
+// ignored (no site id in the topics). b->host is left empty.
+static inline bool gx5_parse_login(const char *js, gx5_broker_t *b, char loc[GX5_LOC_LEN])
+{
+    char cmd[8];
+    memset(b, 0, sizeof *b);
+    return gx5_json_str(js, "cmd", cmd, sizeof cmd) && !strcmp(cmd, "config")
+        && gx5_json_str(js, "user", b->user, sizeof b->user) && b->user[0]
+        && gx5_json_str(js, "pass", b->pass, sizeof b->pass) && b->pass[0]
+        && gx5_json_str(js, "location", loc, GX5_LOC_LEN) && gx5_id_ok(loc);
+}
+
 // UTC calendar time -> Unix epoch (newlib has no timegm). Valid for 1970..2099.
 static inline long long gx5_epoch(int y, int mo, int d, int h, int mi, int s)
 {
