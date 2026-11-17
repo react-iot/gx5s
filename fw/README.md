@@ -126,7 +126,8 @@ it also logs LiPo voltage and current and reports the drain while asleep.
 ECU simulator: `ecu_sim.py` on the Pi plays one engine ECU on `can0` so the device has
 something to ask. It answers OBD-II on `7DF`/`7E0` from `7E8` (service 01 PIDs, VIN by
 `09 02` and `22 F190`, multi-frame included) and J1939 as address `00` (PGN requests,
-address claim, periodic EEC1 / CCVS / ET1 / VEP1 / DD1, VIN over TP). `python3 ecu_sim.py`
+address claim, periodic EEC1 / CCVS / ET1 / VEP1 / DD1 / position `FEF3`, time and date
+`FEE6` and VIN over TP on request). `python3 ecu_sim.py`
 serves until Ctrl-C (`-v` prints every frame, `--quiet` stops the broadcasts);
 `python3 ecu_sim.py check` tests its logic anywhere, without CAN. The device needs ignition
 on and an active mode at the bus's 500 kbit/s:
@@ -136,6 +137,7 @@ on and an active mode at the bus's 500 kbit/s:
 {"can_req":{"slot":0,"id":"7DF","data":"02010C","interval":10}}
 {"can":{"mode":"j1939","bitrate":500000}}
 {"can_req":{"slot":0,"id":"18EA00F8","data":"E5FE00","interval":30}}
+{"can_req":{"slot":1,"id":"18EA00F8","data":"E6FE00","interval":60}}
 ```
 
 ```sh

@@ -10,7 +10,8 @@ One simulated engine ECU, both protocols at once (11-bit ids are OBD-II, 29-bit 
           multi-frame after the tester's flow control.
   J1939   address 00. Answers PGN requests (EA00), claims its address, broadcasts the
           PGNs with a period below (--quiet turns that off). Answers over 8 bytes use
-          TP: RTS/CTS to the requester, BAM when the request was global.
+          TP: RTS/CTS to the requester, BAM when the request was global. Time/date
+          (FEE6, the Pi's UTC clock) and position (FEF3, a simulated track) are included.
 Values follow a slow simulated drive, so they keep changing.
 
 The device must be in an active mode ("obd2" or "j1939"): in "listen" it never
@@ -33,7 +34,8 @@ def drive(t):
     return dict(rpm=1800 + 1000 * s, kmh=60 + 40 * math.sin(t / 15), load=50 + 30 * s, throttle=30 + 20 * s,
                 coolant=min(90, 20 + t / 4), oil=min(95, 20 + t / 5), intake=30, ambient=22,
                 fuel=max(5, 80 - t / 600), volts=13.8 + 0.2 * math.sin(t / 7), run_s=t,
-                km=123456.7 + t / 60, hours=4321 + t / 3600, litres=54321 + t / 1000)
+                km=123456.7 + t / 60, hours=4321 + t / 3600, litres=54321 + t / 1000,
+                lat=-33.86785 + t * 1e-5, lon=151.20732 + t * 1e-5)  # heading north-east from Sydney
 
 
 def u8(v):
@@ -75,7 +77,15 @@ J1939 = {
     0xFEC1: (6, 0, lambda d: struct.pack("<I", round(d["km"] * 200)) + b"\xFF" * 4),                    # distance, 5 m
     0xFEE9: (6, 0, lambda d: b"\xFF" * 4 + struct.pack("<I", round(d["litres"] * 2))),                  # fuel used
     0xFEEC: (6, 0, lambda d: VIN + b"*"),                                                               # VIN (TP)
+    0xFEE6: (6, 0, lambda d: time_date(d["utc"])),                                                      # time/date, UTC
+    0xFEF3: (6, 5, lambda d: struct.pack("<II", round((d["lat"] + 210) * 1e7), round((d["lon"] + 210) * 1e7))),  # position
 }
+
+
+def time_date(utc):
+    """PGN FEE6: seconds 0.25 s/bit, minutes, hours, month, day 0.25 d/bit, year - 1985, no local offset."""
+    t = time.gmtime(utc)
+    return bytes([t.tm_sec * 4, t.tm_min, t.tm_hour, t.tm_mon, t.tm_mday * 4, t.tm_year - 1985, 125, 125])
 
 
 def supported(base):
@@ -87,8 +97,9 @@ def supported(base):
 class Ecu:
     """Frames in (rx), frames out (tick). No CAN in here, so `check` can drive it."""
 
-    def __init__(self, now, broadcast=True):
+    def __init__(self, now, broadcast=True, utc=None):
         self.t0, self.broadcast = now, broadcast
+        self.utc0 = time.time() if utc is None else utc  # wall clock at t0, for the time/date PGN
         self.out = []   # (due, id, ext, data)
         self.cf = []    # ISO-TP consecutive frames waiting for flow control
         self.tp = {}    # J1939 RTS/CTS: requester address -> packets
@@ -100,6 +111,9 @@ class Ecu:
 
     def claim(self, now):
         self.send(now, 0x18EEFF00 | ADDR, bytes.fromhex("0100000000820080"), True)  # arbitrary NAME
+
+    def state(self, now):
+        return dict(drive(now - self.t0), utc=self.utc0 + now - self.t0)
 
     def tick(self, now):
         """Frames that are due, in order."""
@@ -132,7 +146,7 @@ class Ecu:
         if not 1 <= n <= 7 or n > len(data) - 1:
             return False  # only single-frame requests
         req = bytes(data[1:1 + n])
-        rsp = self.service(req, drive(now - self.t0))
+        rsp = self.service(req, self.state(now))
         if rsp is None:  # a functional request nobody supports gets no answer
             if can_id == OBD_PHYS:
                 self.send(now, OBD_TX, bytes([3, 0x7F, req[0], 0x31]).ljust(8, b"\0"))
@@ -185,7 +199,7 @@ class Ecu:
 
     def pgn(self, pgn, now, to=0xFF):
         prio, _, fn = J1939[pgn]
-        data = fn(drive(now - self.t0))
+        data = fn(self.state(now))
         if len(data) <= 8:
             self.send(now, prio << 26 | pgn << 8 | ADDR, data, True)
             return
@@ -201,7 +215,7 @@ class Ecu:
 
 
 def check():
-    e = Ecu(0, broadcast=False)
+    e = Ecu(0, broadcast=False, utc=1794873600)  # 2026-11-17 00:00:00 UTC
     h = bytes.fromhex
     assert e.tick(0) == [(0x18EEFF00, True, h("0100000000820080"))], "address claim at start"
 
@@ -209,7 +223,7 @@ def check():
         assert e.rx(can_id, ext, h(data), at), "request not taken"
         return e.tick(at + 1)
 
-    d = drive(10.0)
+    d = e.state(10.0)
     assert ask(0x7DF, "02010C0000000000") == [(0x7E8, False, b"\x04\x41\x0C" + be16(d["rpm"] * 4) + b"\0\0\0")]
     (_, _, r), = ask(0x7E0, "020100")
     assert r[:3] == h("064100") and r[3] & 0x18 == 0x18 and r[4] & 0x10 and r[6] & 1, "PIDs 04, 05, 0C and 'more' flagged"
@@ -231,6 +245,11 @@ def check():
     assert ask(0x18EA00F8, "00FF00", True) == [(0x18E8FF00, True, h("01FFFFFFF800FF00"))], "NACK"
     assert ask(0x18EAFFF8, "00FF00", True) == [], "global request for an unknown PGN: silence"
 
+    assert ask(0x18EA00F8, "E6FE00", True) == [(0x18FEE600, True, h("2800000B44297D7D"))], "00:00:10 on 17 Nov 2026"
+    (_, _, r), = ask(0x18EAFFF8, "F3FE00", True)
+    lat, lon = (v * 1e-7 - 210 for v in struct.unpack("<II", r))
+    assert abs(lat - d["lat"]) < 1e-6 and abs(lon - d["lon"]) < 1e-6 and lat < 0 < lon, "position round trip"
+
     rts, = ask(0x18EA00F8, "ECFE00", True)  # VIN to one requester: RTS/CTS
     assert rts == (0x1CECF800, True, h("10120003FFECFE00"))
     dts = ask(0x1CEC00F8, "1103" + "01" + "FFFFECFE00", True)
@@ -244,7 +263,8 @@ def check():
 
     b = Ecu(0)  # broadcasts: 10 Hz and 1 Hz PGNs over one second
     ids = [f[0] for t in range(100) for f in b.tick(t / 100)]
-    assert ids.count(0x0CF00400) == 10 and ids.count(0x18FEEE00) == 1 and 0x18FEE500 not in ids
+    assert ids.count(0x0CF00400) == 10 and ids.count(0x18FEEE00) == 1 and ids.count(0x18FEF300) == 1
+    assert 0x18FEE500 not in ids and 0x18FEE600 not in ids, "on-request PGNs are not broadcast"
     print("ecu_sim check ok")
 
 
