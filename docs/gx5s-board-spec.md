@@ -294,11 +294,11 @@ Standalone component page: [TCA9555 GPIO Expander](components/gpio-expander-tca9
 | Expander output | Board function |
 |---|---|
 | P00 | `IO-40` |
-| P01 | `IO-42` |
-| P02 | `IO-43` |
-| P03 | `BAT-CHRG` |
-| P04 | `CHRG-EN` |
-| P05 | No functional net shown |
+| P01 | `IO-41` |
+| P02 | `IO-42` |
+| P03 | `IO-43` |
+| P04 | `BAT-CHRG` (TP4056 `CHRG#`, low while charging) |
+| P05 | `CHRG-EN` |
 | P06 | No functional net shown |
 | P07 | No functional net shown |
 | P10 | No functional net shown |
