@@ -58,6 +58,15 @@ Status: accepted (2026-11-15)
    The same run showed the charger switching every 5 s tick (on: reading under the
    cutoff; off: reading back above it), so it now stops below the cutoff and starts
    again only above cutoff + hysteresis. Not yet run on hardware.
+   The LiPo is measured only with the charger off: charging lifted the reading by
+   ~0.4 V in that run (3787 mV at wake, 4167 mV seconds later), and the "keep the
+   feed on" decision before sleep was made on the lifted value. Before sleep the
+   charger is now stopped first (200 ms to settle, not measured); telemetry `bat_mv`
+   is the last charger-off reading, so it does not move while the LiPo charges.
+   The charger stops only after the modem is parked: stopped before the last publish,
+   with the LiPo at 3.4 V, the modem went silent (`AT+QMTPUB -> no response`, then
+   `modem park timed out`; bench 2026-11-18). The same bench showed the supply reading
+   0.8-1.0 V under the hat (11.2-11.4 V against 12.2 V) while charging a flat LiPo.
 7. **Light sleep while online** needs the modem to announce URCs on RI
    (`urc/ri/other` pulse + `urc/delay`), since UART bytes are lost in light sleep and
    ESP32 UART wake only works on IO_MUX pins. `GX5_LIGHT_SLEEP=n` turns it off.

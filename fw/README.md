@@ -43,6 +43,9 @@ Components do not call each other; only `main` wires them together.
 | `device/<mac>/<loc>/ext` | device → broker | each line received on the external UART (harness SAT pins) |
 | `device/<mac>` and `location/<loc>` | broker → device, QoS 1 | `{"provision":{"pop":"14720943","broker":{"host":"…","port":8883,"user":"…","pass":"…","tls":true},"config":{"location":"0001","can":{"mode":"obd2","bitrate":500000}}}}` provisions; anything else is answered with telemetry |
 
+`bat_mv` is the LiPo at rest: it is read only while the charger is off, so during charging
+(`chg` 1) it holds the last value from before.
+
 `<loc>` is the location id: `0000` until provisioning sets `config.location` (1-9 of
 `A-Z a-z 0-9 _ -`). A command sent to `location/<loc>` reaches every device at that location.
 

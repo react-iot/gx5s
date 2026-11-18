@@ -58,6 +58,7 @@ static const char *TAG = "gx5";
 static RTC_DATA_ATTR bool s_protect; // last sleep was PROTECT (survives deep sleep)
 static bool s_ign, s_connected, s_linger;
 static int s_low_count;
+static bool s_chg; // charger enabled
 static char s_id[18]; // "AA:BB:CC:DD:EE:FF"
 static char s_pop[9]; // provisioning PIN, from the device id
 static const char *s_wake = "power-on";
@@ -86,7 +87,14 @@ static int adc_mv(adc_channel_t ch)
 }
 
 static int vcc_mv(void) { return gx5_vcc_node_to_mv(adc_mv(ADC_CHANNEL_0), CONFIG_GX5_VCC_VBE_MV); }
-static int bat_mv(void) { return adc_mv(ADC_CHANNEL_7) * 22 / 12; } // BAT+ - R8 1K - node - R5 1.2K - GND
+// LiPo voltage, measured only with the charger off: charging lifts the reading by
+// ~0.4 V (soak 2026-11-17), so while it charges this is the last resting value.
+static int bat_mv(void)
+{
+    static int rest;
+    if (!s_chg) rest = adc_mv(ADC_CHANNEL_7) * 22 / 12; // BAT+ - R8 1K - node - R5 1.2K - GND
+    return rest;
+}
 static bool ignition(void) { return gpio_get_level(GX5_PIN_ACC_INT) == 0; }
 
 // Supply is present but too low to keep loading it.
@@ -161,10 +169,7 @@ static void deep_sleep(bool protect)
     // disables the 36V->5V buck (bench: 0.15 mA, against 11.4 mA with it left on).
     // Only a missing or flat LiPo keeps the buck on (6.6 mA): without either supply
     // the MCU browns out, the buck's enable floats back on and the board reboots in a loop.
-    int bat = bat_mv();
-    bool feed = bat < CONFIG_GX5_BAT_MIN_MV;
     bool off = protect || HIBERNATE; // modem powered down for this sleep
-    ESP_LOGW(TAG, "%s: vcc=%d mV bat=%d mV ign=%d feed=%d", protect ? "PROTECT" : off ? "HIBERNATE" : "SLEEP", vcc_mv(), bat, s_ign, feed);
     if (!s_connected && !protect) store_telemetry(); // an offline heartbeat still leaves a record
     gx5_mqtt_publish("status/connected", protect ? "protect" : off ? "hibernate" : "sleep", true);
     gx5_modem_stop(off);
@@ -172,8 +177,15 @@ static void deep_sleep(bool protect)
     gx5_can_stop();
     s_protect = protect;
 
+    // The charger stops only now, after the modem's last transmission: with it off first
+    // and the LiPo at 3.4 V the modem stopped answering mid-publish (bench 2026-11-18).
+    gx5_exp_set(GX5_EXP_CHRG_EN, s_chg = false); // asleep we take nothing: the charger alone drew ~200 mA at 12 V (bench)
+    vTaskDelay(pdMS_TO_TICKS(200)); // ponytail: settling time after the charger stops is not measured; raise if bat reads high here
+    int bat = bat_mv();
+    bool feed = bat < CONFIG_GX5_BAT_MIN_MV;
+    ESP_LOGW(TAG, "%s: vcc=%d mV bat=%d mV ign=%d feed=%d", protect ? "PROTECT" : off ? "HIBERNATE" : "SLEEP", vcc_mv(), bat, s_ign, feed);
+
     gx5_exp_set(GX5_EXP_LED_SVR | GX5_EXP_LED_IG | GX5_EXP_LED_PWR, false);
-    gx5_exp_set(GX5_EXP_CHRG_EN, false); // asleep we take nothing: the charger alone drew ~200 mA at 12 V (bench)
 
     // Freeze every rail/control pin: unheld outputs float in deep sleep.
     gx5_imu_arm();                                // drop a latched motion interrupt
@@ -417,10 +429,9 @@ static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         if (!s_low_count) s_protect = false; // recovered past the hysteresis
         // Charge the LiPo only from a healthy supply. Charging pulls the reading down, so
         // it starts only above the hysteresis: without it the charger switched every tick.
-        static bool chg;
-        if (mv < CONFIG_GX5_VCC_CUTOFF_MV) chg = false;
-        else if (mv >= CONFIG_GX5_VCC_CUTOFF_MV + CONFIG_GX5_VCC_HYST_MV) chg = true;
-        gx5_exp_set(GX5_EXP_CHRG_EN, chg);
+        if (mv < CONFIG_GX5_VCC_CUTOFF_MV) s_chg = false;
+        else if (mv >= CONFIG_GX5_VCC_CUTOFF_MV + CONFIG_GX5_VCC_HYST_MV) s_chg = true;
+        gx5_exp_set(GX5_EXP_CHRG_EN, s_chg);
         if (s_low_count >= 3) deep_sleep(true);               // 3 in a row: rides through cranking dips
         break;
     }
