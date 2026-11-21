@@ -30,8 +30,8 @@ Status: accepted (2026-11-15)
    | RUN | 80 MHz + auto light sleep | MQTT connected | ignition on | — |
    | LINGER | same | MQTT connected | ignition off / timer or RI wake | — |
    | SLEEP | deep sleep | registered, `QSCLK=1`, GNSS off | linger or connect timeout expired | ignition (ext0), RI or motion (ext1), heartbeat timer |
-   | HIBERNATE | deep sleep | powered down (`QPOWD`) | as SLEEP, when `GX5_HIBERNATE=y` | ignition (ext0), motion (ext1), heartbeat timer |
-   | PROTECT | deep sleep | powered down (`QPOWD`) | supply below cutoff | ignition (only if off), recheck timer |
+   | HIBERNATE | deep sleep | radio off (`CFUN=0`), `QSCLK=1`, GNSS off | as SLEEP, when `GX5_HIBERNATE=y` | ignition (ext0), motion (ext1), heartbeat timer |
+   | PROTECT | deep sleep | radio off (`CFUN=0`), `QSCLK=1`, GNSS off | supply below cutoff | ignition (only if off), recheck timer |
 
    In all sleep states the regulator is in power-save mode, the charger is off and
    the harness feed is off, so the board lives on its LiPo and draws ~0.15 mA from
@@ -39,11 +39,33 @@ Status: accepted (2026-11-15)
    (6.6 mA) only when the LiPo is below `GX5_BAT_MIN_MV` or missing: with neither
    supply the MCU would brown out, the buck enable would float back on and the board
    would reboot in a loop. Bench 2026-11-15: a modem URC (RI pulse) woke the board
-   from SLEEP (`wake=modem`) and the modem answered at once. But the modem card
-   still costs ~16 mA at 12 V (feed on) when asleep and registered, against 6.6 mA
-   for the board alone, so on the LiPo it will not last long; eDRX/PSM not tried yet. The battery-sense divider alone (R8 1K + R5 1.2K across the LiPo,
+   from SLEEP (`wake=modem`) and the modem answered at once. The battery-sense divider alone (R8 1K + R5 1.2K across the LiPo,
    schematic sheet 2) takes ~1.9 mA from it at all times. Both ADC readings go
    through the chip's factory calibration (eFuse Vref).
+
+   **The modem card decides the sleep current (bench 2026-11-19 to 21).**
+   - *No power-down.* The BG96 Mini PCIe card has no power-key pin and holds the module's
+     power key low itself. After `AT+QPOWD` (`POWERED DOWN`) or a PSM entry
+     (`PSM POWER DOWN`) it boots again about 6 s later, with only 3.3 V, UART and reset
+     attached, whatever the host does with UART TX/RX, `PERST#` or DTR. Measured at 3.3 V:
+     the current goes from idle straight to boot current (~70 mA), never down. So the
+     firmware never sends `QPOWD`, and sends `AT+CPSMS=0` at every modem start: a stored
+     PSM setting makes the card restart in a loop (every 129 s with no service).
+   - *Sleep needs the card's USB-detect link removed.* On the card the module's `USB_VBUS`
+     is tied to 3.3 V, so the module always sees USB attached and never reaches real
+     sleep: 36 mA awake and 31 mA "asleep" at 3.3 V (radio off, GNSS off, `QSCLK=1`, DTR
+     high). `AT+QCFGEXT="disusb",1` and `"usb/psm",1` change nothing. With the link
+     resistor removed (underside, beside the SIM holder, under module pins 8-10) the same
+     card draws 13.8 mA awake and under 1 mA asleep.
+   - *Board asleep at 12 V, feed on, no LiPo:* unmodified card 20.5 mA; modified card
+     8.5 mA; no card 6.4 mA. Registered sleep (SLEEP) and radio-off sleep (HIBERNATE)
+     cost the same on an unmodified card. For comparison the GX5sV2 build of 2022-10
+     slept at 42.8 mA on the same board.
+   - *The rest is the 5 V buck.* The TPS5430 draws 2 mA (typ, 4.4 max) before it switches
+     and has no light-load mode; with the feed off the harness draws 0.15 mA.
+   - Before the radio-off sleep the firmware sets `AT+QCFG="ledmode",1`: in the default
+     mode the net LED flashes every 2 s all through the sleep.
+   - `GX5_MODEM_AT_LOG=y` logs every modem command and reply (credentials cut).
 
 6. **Never drain the supply.** `VCC < GX5_VCC_CUTOFF_MV` for 3 consecutive samples
    (or once, on a wake with ignition off) forces PROTECT. Leaving PROTECT needs

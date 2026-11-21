@@ -103,12 +103,17 @@ blinks five times and the device announces itself for provisioning again.
 - **Ignition off** — connect, report, stay `GX5_LINGER_S`, then deep sleep with the modem still
   registered. Wakes on ignition, motion (MPU-6050), modem RI (e.g. an SMS) or every `GX5_HEARTBEAT_S`; commands
   sent meanwhile are queued by the broker (persistent session).
-- **Hibernate** (`GX5_HIBERNATE=y`, off by default) — as ignition off, but the modem is powered
-  down while asleep: nothing can reach the device until ignition, motion or the heartbeat timer
-  wakes it, and each wake starts the modem and registers again.
+- **Hibernate** (`GX5_HIBERNATE=y`, off by default) — as ignition off, but the modem radio is
+  off while asleep: nothing can reach the device until ignition, motion or the heartbeat timer
+  wakes it, and each wake registers again.
 - **Offline** — telemetry is queued on the SD NAND with an RTC timestamp and replayed when the broker is back.
-- **Supply below `GX5_VCC_CUTOFF_MV`** — modem powered down, deep sleep, supply re-measured every
+- **Supply below `GX5_VCC_CUTOFF_MV`** — modem radio off, deep sleep, supply re-measured every
   `GX5_PROTECT_RECHECK_S`; resumes above cutoff + `GX5_VCC_HYST_MV`.
+
+Sleep current depends on the modem card: an unmodified BG96 Mini PCIe card keeps the board at
+about 20 mA (12 V) asleep, a card with its USB-detect link removed at about 8.5 mA
+(`docs/adr/0001-base-firmware.md`, decision 5). `GX5_MODEM_AT_LOG=y` prints every modem command
+and reply for debugging.
 
 TLS is terminated in the modem: upload the broker CA once (`AT+QFUPL="cacert.pem",<size>`), or
 set `GX5_MQTT_TLS_SECLEVEL=0` for an unauthenticated (insecure) link while testing.

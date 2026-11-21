@@ -99,6 +99,18 @@ static void urc(char *line)
     }
 }
 
+// GX5_MODEM_AT_LOG: every command and reply line. Lines with credentials (broker login,
+// APN, a received MQTT message, which may be a provisioning message) lose their arguments.
+#ifdef CONFIG_GX5_MODEM_AT_LOG
+static void at_log(const char *dir, const char *s)
+{
+    bool secret = strstr(s, "QMTCONN") || strstr(s, "QICSGP") || strstr(s, "QMTRECV");
+    ESP_LOGI(TAG, "%s %.*s%s", dir, secret ? (int)strcspn(s, "=:") : (int)strlen(s), s, secret ? " ..." : "");
+}
+#else
+#define at_log(dir, s)
+#endif
+
 // One line (CR/LF stripped, blanks skipped) or the bare '>' data prompt.
 static bool read_line(char *buf, size_t size, TickType_t deadline)
 {
@@ -112,6 +124,7 @@ static bool read_line(char *buf, size_t size, TickType_t deadline)
         if (c == '\r' || c == '\n') {
             if (!n) continue;
             buf[n] = '\0';
+            at_log("<", buf);
             return true;
         }
         if (n == 0 && c == ' ') continue;
@@ -133,6 +146,7 @@ static bool at_awake(const char *cmd, const char *expect, char *out, const char 
     bool ok = false, got = !expect;
     int name = (int)strcspn(cmd, "="); // never log arguments (credentials)
 
+    at_log(">", cmd);
     uart_write_bytes(UART, cmd, strlen(cmd));
     uart_write_bytes(UART, "\r", 1);
     while (read_line(line, sizeof line, deadline)) {
@@ -142,6 +156,7 @@ static bool at_awake(const char *cmd, const char *expect, char *out, const char 
             if (strncmp(cmd, "AT+QGPS", 7)) ESP_LOGW(TAG, "%.*s -> %s", name, cmd, line); // "no fix yet" is routine
             return false;
         } else if (payload && (!strcmp(line, ">") || !strcmp(line, "CONNECT"))) { // data prompts
+            at_log(">", payload);
             uart_write_bytes(UART, payload, strlen(payload));
         } else if (expect && !strncmp(line, expect, strlen(expect))) {
             got = true;
@@ -185,6 +200,9 @@ static bool bringup(void)
     }
     AT("ATE0");
     AT("AT+QSCLK=0");
+    at("AT+CFUN=1", NULL, NULL, NULL, 15000); // radio back on after a radio-off sleep
+    AT("AT+QGPSCFG=\"autogps\",0"); // GNSS starts only when asked (GX5sV2 stored auto-start in the modem)
+    AT("AT+CPSMS=0"); // never PSM: this card wakes from it at once, which is a modem restart mid-session
     // Pulse RI 120 ms before every URC and hold the URC until the pulse ends, so
     // the MCU can light-sleep and still catch +QMTRECV (see ADR 0001 §7).
     AT("AT+QCFG=\"risignaltype\",\"physical\"");
@@ -480,18 +498,36 @@ static void serve(void)
     if (held) esp_pm_lock_release(s_awake);
 }
 
+// GNSS off, confirmed: left on it searches at ~42 mA and the modem never sleeps. The
+// first AT+QGPSEND after the last publish got no answer (bench 2026-11-19), so ask again.
+static void gnss_off(void)
+{
+    char line[LINE_LEN];
+    for (int i = 0; i < 5; i++) {
+        at("AT+QGPSEND", NULL, NULL, NULL, 3000);
+        line[0] = '\0';
+        if (at("AT+QGPS?", "+QGPS:", line, NULL, 2000) && strstr(line, "+QGPS: 0")) return;
+    }
+    ESP_LOGE(TAG, "GNSS still on");
+}
+
 static void park(void)
 {
     esp_pm_lock_acquire(s_awake);
     vTaskDelay(pdMS_TO_TICKS(300)); // let an aborted command finish talking
     uart_flush_input(UART);
     if (s_stop == 2) {
-        if (!sync_at(2)) ESP_LOGI(TAG, "modem already off");
-        else if (!at("AT+QPOWD=1", "POWERED DOWN", NULL, NULL, 10000)) ESP_LOGE(TAG, "modem did not confirm power down");
+        // Not AT+QPOWD: the card confirms it, then starts again by itself ~6 s later and
+        // runs awake all through the sleep (bench 2026-11-19: LiPo flat in 5.5 h).
+        s_session = false;
+        gnss_off();
+        AT("AT+QCFG=\"ledmode\",1"); // net LED off while the radio is off; the default mode blinks it every 2 s all through the sleep
+        if (!at("AT+CFUN=0", NULL, NULL, NULL, 15000)) ESP_LOGE(TAG, "modem radio not off"); // deregisters
+        AT("AT+QSCLK=1");
     } else {
         if (s_session) at("AT+QMTDISC=0", "+QMTDISC:", NULL, NULL, DISC_MS); // never connected: no URC comes, time wasted
         s_session = false;
-        AT("AT+QGPSEND");                                   // GNSS off, or the modem never sleeps
+        gnss_off();
         AT("AT+QSCLK=1");                                   // modem sleeps when idle, stays registered
     }
     uart_wait_tx_done(UART, pdMS_TO_TICKS(200));

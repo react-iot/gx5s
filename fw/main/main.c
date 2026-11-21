@@ -107,6 +107,8 @@ static void store_telemetry(void);
 
 // ── Sleep ───────────────────────────────────────────────────────────────────
 
+static const int s_sd_in[] = {GX5_PIN_SD_CS, GX5_PIN_SD_CLK, GX5_PIN_SD_MOSI};
+
 static void hold(int pin, int level)
 {
     gpio_set_level(pin, level);
@@ -192,6 +194,11 @@ static void deep_sleep(bool protect)
     hold(GX5_PIN_3V3_PSM, 0); // regulator power-save mode: IMU/expander/RTC stay powered, ~5 mA less
     hold(GX5_PIN_SD_3V3, 0);
     hold(GX5_PIN_GSM_RST, 1);
+    if (CONFIG_GX5_CAN_EN_GPIO >= 0) hold(CONFIG_GX5_CAN_EN_GPIO, 1); // CAN transceiver stays in standby
+    for (int i = 0; i < 3; i++) { // SD NAND is unpowered: its inputs low, so no pin feeds it
+        gpio_set_direction(s_sd_in[i], GPIO_MODE_OUTPUT);
+        hold(s_sd_in[i], 0);
+    }
     hold(CONFIG_GX5_MODEM_TX_GPIO, 1); // idle-high UART line, or the modem never sleeps
     if (CONFIG_GX5_EXT_PWR_GPIO >= 0) hold(CONFIG_GX5_EXT_PWR_GPIO, feed ? EXT_PWR_ON : !EXT_PWR_ON);
     gpio_deep_sleep_hold_en();
@@ -457,6 +464,7 @@ void app_main(void)
     int outs[] = {GX5_PIN_3V3_PSM, GX5_PIN_SD_3V3, GX5_PIN_GSM_RST, CONFIG_GX5_MODEM_TX_GPIO, CONFIG_GX5_EXT_PWR_GPIO};
     int levels[] = {1, 0, 1, 1, EXT_PWR_ON}; // awake: regulator in normal mode, fed from the harness; SD on per use
     gpio_deep_sleep_hold_dis();
+    for (int i = 0; i < 3; i++) gpio_hold_dis(s_sd_in[i]);
     for (int i = 0; i < 5; i++) {
         if (outs[i] < 0) continue;
         gpio_config_t out = {.pin_bit_mask = 1ULL << outs[i], .mode = GPIO_MODE_OUTPUT};
@@ -468,6 +476,7 @@ void app_main(void)
     gpio_config(&in);
 #if CONFIG_GX5_CAN_EN_GPIO >= 0
     gpio_config_t en = {.pin_bit_mask = 1ULL << CONFIG_GX5_CAN_EN_GPIO, .mode = GPIO_MODE_OUTPUT};
+    gpio_hold_dis(CONFIG_GX5_CAN_EN_GPIO);
     gpio_set_level(CONFIG_GX5_CAN_EN_GPIO, 1); // CAN transceiver in standby until ignition
     gpio_config(&en);
 #endif

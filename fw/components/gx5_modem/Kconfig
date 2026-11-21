@@ -48,6 +48,14 @@ menu "GX5s modem and MQTT"
         string "Cellular APN (empty = keep the modem's stored APN)"
         default ""
 
+    config GX5_MODEM_AT_LOG
+        bool "Log every AT command and reply (debugging)"
+        default n
+        help
+            Prints each command sent to the modem (">") and each line it returns ("<").
+            Lines that carry credentials (broker login, APN, received MQTT messages)
+            are cut after the command name.
+
     config GX5_GNSS
         bool "Read the modem's GNSS fix (lat/lon/kmh) for telemetry, live and offline"
         default y
