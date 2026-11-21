@@ -47,12 +47,18 @@
 #else
 #define MOTION_WAKE false
 #endif
+#ifdef CONFIG_GX5_HIBERNATE
+#define HIBERNATE true
+#else
+#define HIBERNATE false
+#endif
 
 static const char *TAG = "gx5";
 
 static RTC_DATA_ATTR bool s_protect; // last sleep was PROTECT (survives deep sleep)
 static bool s_ign, s_connected, s_linger;
 static int s_low_count;
+static bool s_chg; // charger enabled
 static char s_id[18]; // "AA:BB:CC:DD:EE:FF"
 static char s_pop[9]; // provisioning PIN, from the device id
 static const char *s_wake = "power-on";
@@ -81,7 +87,14 @@ static int adc_mv(adc_channel_t ch)
 }
 
 static int vcc_mv(void) { return gx5_vcc_node_to_mv(adc_mv(ADC_CHANNEL_0), CONFIG_GX5_VCC_VBE_MV); }
-static int bat_mv(void) { return adc_mv(ADC_CHANNEL_7) * 22 / 12; } // BAT+ - R8 1K - node - R5 1.2K - GND
+// LiPo voltage, measured only with the charger off: charging lifts the reading by
+// ~0.4 V (soak 2026-11-17), so while it charges this is the last resting value.
+static int bat_mv(void)
+{
+    static int rest;
+    if (!s_chg) rest = adc_mv(ADC_CHANNEL_7) * 22 / 12; // BAT+ - R8 1K - node - R5 1.2K - GND
+    return rest;
+}
 static bool ignition(void) { return gpio_get_level(GX5_PIN_ACC_INT) == 0; }
 
 // Supply is present but too low to keep loading it.
@@ -94,6 +107,8 @@ static void store_telemetry(void);
 
 // ── Sleep ───────────────────────────────────────────────────────────────────
 
+static const int s_sd_in[] = {GX5_PIN_SD_CS, GX5_PIN_SD_CLK, GX5_PIN_SD_MOSI};
+
 static void hold(int pin, int level)
 {
     gpio_set_level(pin, level);
@@ -101,6 +116,7 @@ static void hold(int pin, int level)
 }
 
 // SLEEP: modem stays registered, RI/ignition/heartbeat wake us.
+// HIBERNATE (GX5_HIBERNATE): the same sleep with the modem off, so no RI wake.
 // PROTECT: modem off, only ignition (if currently off) and a recheck timer wake us.
 // ── Factory reset: five fast resets ─────────────────────────────────────────
 // Five resets in a row (reset button or power cycle), each within about 5 s of the
@@ -155,24 +171,34 @@ static void deep_sleep(bool protect)
     // disables the 36V->5V buck (bench: 0.15 mA, against 11.4 mA with it left on).
     // Only a missing or flat LiPo keeps the buck on (6.6 mA): without either supply
     // the MCU browns out, the buck's enable floats back on and the board reboots in a loop.
-    int bat = bat_mv();
-    bool feed = bat < CONFIG_GX5_BAT_MIN_MV;
-    ESP_LOGW(TAG, "%s: vcc=%d mV bat=%d mV ign=%d feed=%d", protect ? "PROTECT" : "SLEEP", vcc_mv(), bat, s_ign, feed);
+    bool off = protect || HIBERNATE; // modem powered down for this sleep
     if (!s_connected && !protect) store_telemetry(); // an offline heartbeat still leaves a record
-    gx5_mqtt_publish("status/connected", protect ? "protect" : "sleep", true);
-    gx5_modem_stop(protect);
+    gx5_mqtt_publish("status/connected", protect ? "protect" : off ? "hibernate" : "sleep", true);
+    gx5_modem_stop(off);
     gx5_exp_set(GX5_EXP_GSM_SLP, true); // DTR high: the modem may now sleep; low again at boot (expander init)
     gx5_can_stop();
     s_protect = protect;
 
+    // The charger stops only now, after the modem's last transmission: with it off first
+    // and the LiPo at 3.4 V the modem stopped answering mid-publish (bench 2026-11-18).
+    gx5_exp_set(GX5_EXP_CHRG_EN, s_chg = false); // asleep we take nothing: the charger alone drew ~200 mA at 12 V (bench)
+    vTaskDelay(pdMS_TO_TICKS(200)); // ponytail: settling time after the charger stops is not measured; raise if bat reads high here
+    int bat = bat_mv();
+    bool feed = bat < CONFIG_GX5_BAT_MIN_MV;
+    ESP_LOGW(TAG, "%s: vcc=%d mV bat=%d mV ign=%d feed=%d", protect ? "PROTECT" : off ? "HIBERNATE" : "SLEEP", vcc_mv(), bat, s_ign, feed);
+
     gx5_exp_set(GX5_EXP_LED_SVR | GX5_EXP_LED_IG | GX5_EXP_LED_PWR, false);
-    gx5_exp_set(GX5_EXP_CHRG_EN, false); // asleep we take nothing: the charger alone drew ~200 mA at 12 V (bench)
 
     // Freeze every rail/control pin: unheld outputs float in deep sleep.
     gx5_imu_arm();                                // drop a latched motion interrupt
     hold(GX5_PIN_3V3_PSM, 0); // regulator power-save mode: IMU/expander/RTC stay powered, ~5 mA less
     hold(GX5_PIN_SD_3V3, 0);
     hold(GX5_PIN_GSM_RST, 1);
+    if (CONFIG_GX5_CAN_EN_GPIO >= 0) hold(CONFIG_GX5_CAN_EN_GPIO, 1); // CAN transceiver stays in standby
+    for (int i = 0; i < 3; i++) { // SD NAND is unpowered: its inputs low, so no pin feeds it
+        gpio_set_direction(s_sd_in[i], GPIO_MODE_OUTPUT);
+        hold(s_sd_in[i], 0);
+    }
     hold(CONFIG_GX5_MODEM_TX_GPIO, 1); // idle-high UART line, or the modem never sleeps
     if (CONFIG_GX5_EXT_PWR_GPIO >= 0) hold(CONFIG_GX5_EXT_PWR_GPIO, feed ? EXT_PWR_ON : !EXT_PWR_ON);
     gpio_deep_sleep_hold_en();
@@ -185,7 +211,7 @@ static void deep_sleep(bool protect)
     gpio_wakeup_disable(GX5_PIN_GSM_INT);
     esp_sleep_enable_ext0_wakeup(GX5_PIN_ACC_INT, ignition() ? 1 : 0); // next ignition change
     if (!protect) {
-        int pins[] = {GX5_PIN_GSM_INT, MOTION_WAKE ? GX5_PIN_APS_INT : -1};
+        int pins[] = {off ? -1 : GX5_PIN_GSM_INT, MOTION_WAKE ? GX5_PIN_APS_INT : -1}; // no RI from a modem that is off
         uint64_t mask = 0;
         for (int i = 0; i < 2; i++) {
             if (pins[i] < 0) continue;
@@ -318,6 +344,16 @@ static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         gx5_broker_t b;
         char ext[GX5_EXT_LINE];
         bool is_prov;
+        char loc0[GX5_LOC_LEN];
+        if (!strncmp(m->topic, "discovery/", 10)) { // unprovisioned: only a login matters (our own announcement echoes here too)
+            if (gx5_parse_login(m->data, &b, loc0)) {
+                ESP_LOGI(TAG, "login received, location %s", loc0);
+                gx5_location_set(loc0, false);
+                apply_ignition(); // ignition off: fresh connect window to try it
+                gx5_broker_set(&b);
+            }
+            break;
+        }
         const char *prov = gx5_provision(m->data, s_pop, &is_prov);
         if (is_prov || gx5_parse_broker(m->data, &b)) {
             // The broker only ever changes through {"provision":{"pop":..}} with this device's PIN.
@@ -342,6 +378,15 @@ static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
                 ESP_LOGI(TAG, "new broker: %s:%d", b.host, b.port);
                 apply_ignition(); // ignition off: fresh connect window to try it
                 gx5_broker_set(&b);
+            }
+        } else if (gx5_json_str(m->data, "cmd", ext, sizeof ext) && !strcmp(ext, "ota")) {
+            // {"cmd":"ota","version":"1.4.2"}; no version = "latest"
+            char ver[16];
+            if (!gx5_json_str(m->data, "version", ver, sizeof ver) || (ver[0] && !gx5_ver_ok(ver))) {
+                ESP_LOGW(TAG, "ota: bad version");
+            } else {
+                ESP_LOGI(TAG, "ota requested: %s", ver[0] ? ver : "latest");
+                gx5_ota_start(ver[0] ? ver : "latest");
             }
         } else if (gx5_can_command(m->data)) {
             // applied and stored by can.c
@@ -389,12 +434,18 @@ static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         int mv = vcc_mv();
         s_low_count = supply_low(mv) ? s_low_count + 1 : 0;
         if (!s_low_count) s_protect = false; // recovered past the hysteresis
-        gx5_exp_set(GX5_EXP_CHRG_EN, mv >= CONFIG_GX5_VCC_CUTOFF_MV); // charge the LiPo only from a healthy supply
+        // Charge the LiPo only from a healthy supply. Charging pulls the reading down, so
+        // it starts only above the hysteresis: without it the charger switched every tick.
+        if (mv < CONFIG_GX5_VCC_CUTOFF_MV) s_chg = false;
+        else if (mv >= CONFIG_GX5_VCC_CUTOFF_MV + CONFIG_GX5_VCC_HYST_MV) s_chg = true;
+        gx5_exp_set(GX5_EXP_CHRG_EN, s_chg);
         if (s_low_count >= 3) deep_sleep(true);               // 3 in a row: rides through cranking dips
         break;
     }
     case GX5_EV_SLEEP_DUE:
-        if (!s_ign) deep_sleep(false);
+        if (s_ign) break;
+        if (gx5_ota_busy()) esp_timer_start_once(s_t_sleep, SEC(CONFIG_GX5_LINGER_S)); // let the update finish
+        else deep_sleep(false);
         break;
     }
 }
@@ -413,6 +464,7 @@ void app_main(void)
     int outs[] = {GX5_PIN_3V3_PSM, GX5_PIN_SD_3V3, GX5_PIN_GSM_RST, CONFIG_GX5_MODEM_TX_GPIO, CONFIG_GX5_EXT_PWR_GPIO};
     int levels[] = {1, 0, 1, 1, EXT_PWR_ON}; // awake: regulator in normal mode, fed from the harness; SD on per use
     gpio_deep_sleep_hold_dis();
+    for (int i = 0; i < 3; i++) gpio_hold_dis(s_sd_in[i]);
     for (int i = 0; i < 5; i++) {
         if (outs[i] < 0) continue;
         gpio_config_t out = {.pin_bit_mask = 1ULL << outs[i], .mode = GPIO_MODE_OUTPUT};
@@ -424,6 +476,7 @@ void app_main(void)
     gpio_config(&in);
 #if CONFIG_GX5_CAN_EN_GPIO >= 0
     gpio_config_t en = {.pin_bit_mask = 1ULL << CONFIG_GX5_CAN_EN_GPIO, .mode = GPIO_MODE_OUTPUT};
+    gpio_hold_dis(CONFIG_GX5_CAN_EN_GPIO);
     gpio_set_level(CONFIG_GX5_CAN_EN_GPIO, 1); // CAN transceiver in standby until ignition
     gpio_config(&en);
 #endif
@@ -449,13 +502,14 @@ void app_main(void)
     mac[5] += 3; // device id = factory MAC + 3
     snprintf(s_id, sizeof s_id, "%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     printf("############################################################\n");
-    printf("## %-54s ##\n", CONFIG_GX5_MANUFACTURER);
+    printf("## %-54s ##\n", CONFIG_GX5_MANUFACTURER " - " CONFIG_GX5_WEBSITE);
     printf("## %-54s ##\n", CONFIG_GX5_PRODUCT_NAME);
     gx5_pop(mac, s_pop);
     printf("## ID: %-50s ##\n", s_id);
     printf("## PIN: %-49s ##\n", s_pop);
     printf("## HW: %-50s ##\n", CONFIG_GX5_PRODUCT_ID);
     printf("## FW: v%-49s ##\n", esp_app_get_description()->version);
+    printf("## %-54s ##\n", CONFIG_GX5_REPO);
     printf("############################################################\n");
 
     vTaskDelay(pdMS_TO_TICKS(300)); // regulator + ACC/VCC dividers settle

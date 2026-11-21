@@ -29,9 +29,18 @@ static i2c_master_dev_handle_t i2c_dev(uint8_t addr)
     return h;
 }
 
-// A device that fails once is dropped for this boot (no log spam, no retries).
-static bool i2c_fail(i2c_master_dev_handle_t *d, const char *name)
+#define I2C_TRIES 3
+
+// One transfer, retried: the harness shares this bus, so another master (the bench Pi)
+// or noise can spoil a single transfer. A device that fails I2C_TRIES times in a row
+// is dropped for this boot (no log spam).
+static bool xfer(i2c_master_dev_handle_t *d, const char *name, const uint8_t *w, size_t wn, uint8_t *r, size_t rn)
 {
+    if (!*d) return false;
+    for (int i = 0; i < I2C_TRIES; i++) {
+        if (i) vTaskDelay(pdMS_TO_TICKS(10));
+        if ((r ? i2c_master_transmit_receive(*d, w, wn, r, rn, 50) : i2c_master_transmit(*d, w, wn, 50)) == ESP_OK) return true;
+    }
     ESP_LOGW(TAG, "%s not responding, disabled", name);
     *d = NULL;
     return false;
@@ -39,14 +48,12 @@ static bool i2c_fail(i2c_master_dev_handle_t *d, const char *name)
 
 static bool wr(i2c_master_dev_handle_t *d, const char *name, const uint8_t *b, size_t n)
 {
-    if (!*d) return false;
-    return i2c_master_transmit(*d, b, n, 50) == ESP_OK || i2c_fail(d, name);
+    return xfer(d, name, b, n, NULL, 0);
 }
 
 static bool rd(i2c_master_dev_handle_t *d, const char *name, uint8_t reg, uint8_t *b, size_t n)
 {
-    if (!*d) return false;
-    return i2c_master_transmit_receive(*d, &reg, 1, b, n, 50) == ESP_OK || i2c_fail(d, name);
+    return xfer(d, name, &reg, 1, b, n);
 }
 
 // Every address that answers, as " 0x20 0x51 ...". The harness I2C pins are this same
@@ -209,7 +216,9 @@ static void rtc_init(void)
     int mo = dec(d[5] & 0x1f), day = dec(d[3] & 0x3f);
     if (mo < 1 || mo > 12 || day < 1) return;
     struct timeval tv = {.tv_sec = gx5_epoch(2000 + dec(d[6]), mo, day, dec(d[2] & 0x3f), dec(d[1] & 0x7f), dec(d[0] & 0x7f))};
-    if (tv.tv_sec > 1700000000) settimeofday(&tv, NULL);
+    if (tv.tv_sec <= 1700000000) return;
+    settimeofday(&tv, NULL);
+    ESP_LOGI(TAG, "clock from RTC: %lld", (long long)tv.tv_sec);
 }
 
 void gx5_i2c_init(void)

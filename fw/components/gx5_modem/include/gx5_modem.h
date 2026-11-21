@@ -19,5 +19,9 @@ void gx5_broker_set(const gx5_broker_t *b);
 // Store a new location id (gx5_id_ok). It applies at the next connect; `reconnect`
 // forces one now (leave false when gx5_broker_set follows).
 void gx5_location_set(const char *loc, bool reconnect);
+// Fetch <GX5_OTA_URL>/fw/<hardware id>-<version>.bin through the modem, write it to the
+// other app slot and reboot into it. Needs a broker connection. Result: `event` topic.
+void gx5_ota_start(const char *version);
+bool gx5_ota_busy(void); // keep the device awake while this is true
 // Blocks until the modem is parked for SLEEP (registered, QSCLK=1) or powered off.
 void gx5_modem_stop(bool power_off);

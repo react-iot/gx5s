@@ -3,20 +3,28 @@ menu "GX5s application"
     config GX5_MANUFACTURER
         string "Manufacturer (startup banner)"
         default "React IoT"
+    config GX5_WEBSITE
+        string "Manufacturer website (startup banner)"
+        default "reactiot.com.au"
+    config GX5_REPO
+        string "Source repository (startup banner)"
+        default "github.com/react-iot/gx5s"
     config GX5_PRODUCT_NAME
         string "Product name (startup banner)"
         default "GX5s Logger"
     config GX5_PRODUCT_ID
         string "Hardware id (startup banner)"
-        default "GX5s-v210620"
+        default "riot-gx5s"
 
     menu "Supply protection"
         config GX5_VCC_CUTOFF_MV
             int "Enter PROTECT below this supply voltage (mV)"
-            default 11800
+            default 11000
             help
-                12 V lead-acid at rest: 12.0 V is ~50 %, 11.8 V ~30 %.
-                Use ~23600 for 24 V systems.
+                11 V is what the earlier GX5sV2 firmware used. The board reads up to
+                ~0.6 V below the supply while the LiPo charges, so a cutoff near the
+                resting voltage (12 V lead-acid: 12.0 V is ~50 %, 11.8 V ~30 %) trips
+                on a healthy battery. Use ~22000 for 24 V systems.
         config GX5_VCC_HYST_MV
             int "Leave PROTECT only above cutoff + this (mV)"
             default 400
@@ -54,6 +62,19 @@ menu "GX5s application"
         config GX5_HEARTBEAT_S
             int "Ignition off: wake and report every (s)"
             default 3600
+        config GX5_HIBERNATE
+            bool "Ignition off: modem radio off while asleep (hibernate)"
+            default n
+            help
+                Off (standby): the modem sleeps but stays registered, so an
+                SMS or a queued command can wake the device, and a wake
+                reconnects in seconds.
+                On (hibernate): the modem radio is switched off (AT+CFUN=0)
+                for every ignition-off sleep. The device cannot be reached
+                until it wakes by itself (ignition, motion or the heartbeat
+                timer), and every wake pays a network registration. The
+                BG96 Mini PCIe card cannot be powered down: it restarts by
+                itself (docs/adr/0001-base-firmware.md, decision 5).
         config GX5_TELEMETRY_S
             int "Ignition on: publish telemetry every (s)"
             default 60

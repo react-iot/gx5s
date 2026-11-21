@@ -145,6 +145,44 @@ def test_external_i2c(hat, con):
     assert {"0x20", "0x40", "0x51", "0x68"} <= set(m[1].split()), m[1]
 
 
+def rtc_write(hat, t):
+    """Set the board's PCF8563 (0x51) to UTC time t, from the Pi over the shared I2C bus."""
+    bcd = lambda v: v // 10 << 4 | v % 10
+    g = time.gmtime(t)
+    hat.bus.write_i2c_block_data(0x51, 0x02, [bcd(g.tm_sec), bcd(g.tm_min), bcd(g.tm_hour), bcd(g.tm_mday),
+                                              (g.tm_wday + 1) % 7, bcd(g.tm_mon), bcd(g.tm_year % 100)])
+
+
+def boot_with_rtc(hat, con, t):
+    """Set the RTC to t with the board held in reset (running, it rewrites the RTC from
+    network time every few seconds), then let it boot. Returns the clock it starts with."""
+    con.s.dtr = False
+    con.s.rts = True
+    time.sleep(0.3)
+    rtc_write(hat, t)
+    con.reset()
+    return int(con.expect(r"io: clock from RTC: (\d+)", 10)[1])
+
+
+def test_rtc_sets_clock(hat, con):
+    # At boot the system clock comes from the RTC (network or GPS time corrects it later).
+    back = 400 * 86400
+    off = boot_with_rtc(hat, con, int(time.time()) - back) - (time.time() - back)
+    assert abs(off) <= 3, f"clock is {off:.0f} s off the RTC"
+
+
+def test_network_time_sets_rtc(hat, con):
+    # The modem's network time (UTC) must reach the RTC without any broker. Needs a SIM
+    # and coverage. Follows test_rtc_sets_clock: the RTC is still 400 days behind.
+    import calendar
+    con.expect(r"modem: time ", 200)
+    time.sleep(1)
+    d = hat.bus.read_i2c_block_data(0x51, 0x02, 7)
+    dec = lambda b: (b >> 4) * 10 + (b & 0x0F)
+    rtc = calendar.timegm((2000 + dec(d[6]), dec(d[5] & 0x1F), dec(d[3] & 0x3F), dec(d[2] & 0x3F), dec(d[1] & 0x7F), dec(d[0] & 0x7F)))
+    assert abs(rtc - time.time()) <= 5, f"RTC is {rtc - time.time():.0f} s off after network time"
+
+
 def test_ignition_on(hat, con):
     hat.acc(True)
     con.expect(r"ignition on", 5)
