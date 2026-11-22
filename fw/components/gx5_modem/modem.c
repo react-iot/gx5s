@@ -516,20 +516,18 @@ static void park(void)
     esp_pm_lock_acquire(s_awake);
     vTaskDelay(pdMS_TO_TICKS(300)); // let an aborted command finish talking
     uart_flush_input(UART);
+    // End the session first, also before the radio goes off: a link that just drops makes
+    // the broker publish our will ("offline") over the status we sent last.
+    if (s_session) at("AT+QMTDISC=0", "+QMTDISC:", NULL, NULL, DISC_MS); // never connected: no URC comes, time wasted
+    s_session = false;
+    gnss_off();
     if (s_stop == 2) {
         // Not AT+QPOWD: the card confirms it, then starts again by itself ~6 s later and
         // runs awake all through the sleep (bench 2026-11-19: LiPo flat in 5.5 h).
-        s_session = false;
-        gnss_off();
         AT("AT+QCFG=\"ledmode\",1"); // net LED off while the radio is off; the default mode blinks it every 2 s all through the sleep
         if (!at("AT+CFUN=0", NULL, NULL, NULL, 15000)) ESP_LOGE(TAG, "modem radio not off"); // deregisters
-        AT("AT+QSCLK=1");
-    } else {
-        if (s_session) at("AT+QMTDISC=0", "+QMTDISC:", NULL, NULL, DISC_MS); // never connected: no URC comes, time wasted
-        s_session = false;
-        gnss_off();
-        AT("AT+QSCLK=1");                                   // modem sleeps when idle, stays registered
     }
+    AT("AT+QSCLK=1"); // modem sleeps when idle; registered unless the radio is off
     uart_wait_tx_done(UART, pdMS_TO_TICKS(200));
     esp_pm_lock_release(s_awake);
 }
