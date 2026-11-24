@@ -7,8 +7,10 @@
 #include "esp_app_desc.h"
 #include "esp_attr.h"
 #include "esp_log.h"
+#include "esp_ota_ops.h"
 #include "esp_pm.h"
 #include "esp_sleep.h"
+#include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
@@ -18,6 +20,9 @@
 #include "gx5_modem.h"
 
 #define UART     UART_NUM_1
+// +QMTDISC: once took longer than 5 s on the bench (2026-11-17). Giving up early
+// leaves the session open and the late URC wakes the board right after it sleeps.
+#define DISC_MS  15000
 #define LINE_LEN 640 // +QMTRECV line: topic + a 511-byte payload
 #define AT(cmd)  at(cmd, NULL, NULL, NULL, 2000)
 #define STR_(x)  #x
@@ -26,7 +31,7 @@
 static const char *TAG = "modem";
 
 typedef struct {
-    enum { M_PUB, M_RI, M_STOP, M_RECONNECT } type;
+    enum { M_PUB, M_RI, M_STOP, M_RECONNECT, M_OTA } type; // M_OTA: version in data
     bool retain;
     char topic[96]; // queued M_PUB: subtopic only; the modem task adds device/<id>/<location>/
     char data[GX5_PUB_MAX];
@@ -94,6 +99,20 @@ static void urc(char *line)
     }
 }
 
+// GX5_MODEM_AT_LOG or debug mode: every command and reply line. Lines with credentials (broker login,
+// APN, a received MQTT message, which may be a provisioning message) lose their arguments.
+#ifdef CONFIG_GX5_MODEM_AT_LOG
+#define AT_LOG true
+#else
+#define AT_LOG false // only in debug mode
+#endif
+static void at_log(const char *dir, const char *s)
+{
+    if (!AT_LOG && !gx5_debug) return;
+    bool secret = strstr(s, "QMTCONN") || strstr(s, "QICSGP") || strstr(s, "QMTRECV");
+    ESP_LOGI(TAG, "%s %.*s%s", dir, secret ? (int)strcspn(s, "=:") : (int)strlen(s), s, secret ? " ..." : "");
+}
+
 // One line (CR/LF stripped, blanks skipped) or the bare '>' data prompt.
 static bool read_line(char *buf, size_t size, TickType_t deadline)
 {
@@ -107,6 +126,7 @@ static bool read_line(char *buf, size_t size, TickType_t deadline)
         if (c == '\r' || c == '\n') {
             if (!n) continue;
             buf[n] = '\0';
+            at_log("<", buf);
             return true;
         }
         if (n == 0 && c == ' ') continue;
@@ -121,13 +141,14 @@ static bool read_line(char *buf, size_t size, TickType_t deadline)
 // Send cmd. Succeeds once "OK" and (if given) a line starting with `expect` have
 // both arrived, in either order; that line is copied to `out` (LINE_LEN) if set.
 // `payload` is written at the '>' prompt. Unrelated lines are handled as URCs.
-static bool at(const char *cmd, const char *expect, char *out, const char *payload, int timeout_ms)
+static bool at_awake(const char *cmd, const char *expect, char *out, const char *payload, int timeout_ms)
 {
     char line[LINE_LEN];
     TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
     bool ok = false, got = !expect;
     int name = (int)strcspn(cmd, "="); // never log arguments (credentials)
 
+    at_log(">", cmd);
     uart_write_bytes(UART, cmd, strlen(cmd));
     uart_write_bytes(UART, "\r", 1);
     while (read_line(line, sizeof line, deadline)) {
@@ -136,7 +157,8 @@ static bool at(const char *cmd, const char *expect, char *out, const char *paylo
         } else if (!strncmp(line, "ERROR", 5) || !strncmp(line, "+CME ERROR", 10) || !strncmp(line, "+CMS ERROR", 10)) {
             if (strncmp(cmd, "AT+QGPS", 7)) ESP_LOGW(TAG, "%.*s -> %s", name, cmd, line); // "no fix yet" is routine
             return false;
-        } else if (payload && !strcmp(line, ">")) {
+        } else if (payload && (!strcmp(line, ">") || !strcmp(line, "CONNECT"))) { // data prompts
+            at_log(">", payload);
             uart_write_bytes(UART, payload, strlen(payload));
         } else if (expect && !strncmp(line, expect, strlen(expect))) {
             got = true;
@@ -148,6 +170,16 @@ static bool at(const char *cmd, const char *expect, char *out, const char *paylo
     }
     ESP_LOGW(TAG, "%.*s -> no response", name, cmd);
     return false;
+}
+
+// One command and its reply. UART bytes are lost in light sleep, so the MCU stays
+// awake for the whole exchange whoever calls (the lock counts, nesting is fine).
+static bool at(const char *cmd, const char *expect, char *out, const char *payload, int timeout_ms)
+{
+    esp_pm_lock_acquire(s_awake);
+    bool ok = at_awake(cmd, expect, out, payload, timeout_ms);
+    esp_pm_lock_release(s_awake);
+    return ok;
 }
 
 static bool sync_at(int tries)
@@ -170,6 +202,9 @@ static bool bringup(void)
     }
     AT("ATE0");
     AT("AT+QSCLK=0");
+    at("AT+CFUN=1", NULL, NULL, NULL, 15000); // radio back on after a radio-off sleep
+    AT("AT+QGPSCFG=\"autogps\",0"); // GNSS starts only when asked (GX5sV2 stored auto-start in the modem)
+    AT("AT+CPSMS=0"); // never PSM: this card wakes from it at once, which is a modem restart mid-session
     // Pulse RI 120 ms before every URC and hold the URC until the pulse ends, so
     // the MCU can light-sleep and still catch +QMTRECV (see ADR 0001 §7).
     AT("AT+QCFG=\"risignaltype\",\"physical\"");
@@ -180,7 +215,12 @@ static bool bringup(void)
 #ifdef CONFIG_GX5_GNSS
     AT("AT+QGPS=1"); // errors if already running
 #endif
-    if (!at("AT+CPIN?", "+CPIN: READY", NULL, NULL, 5000)) return false;
+    // Right after AT+CFUN=1 the SIM is still starting: +CME ERROR: 14 (SIM busy). Ask again
+    // rather than fail the whole bring-up and wait out the 5 s back-off (soak 2026-11-22).
+    for (int i = 0; !at("AT+CPIN?", "+CPIN: READY", NULL, NULL, 5000); i++) {
+        if (i >= 20 || (s_stop && s_abortable)) return false; // ~4 s: no SIM
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
     AT("AT+CMGD=1,4"); // SMS is only a wake-up poke: drop it so storage never fills
 
     for (int i = 0;; i++) {
@@ -211,11 +251,22 @@ static bool mqtt_connect(const gx5_broker_t *b)
     char cmd[256], line[LINE_LEN];
     int result = -1;
 
+    // A socket left open from before sleep: opening over it fails with "client identifier
+    // occupied" (+QMTOPEN: 0,2), so wait for the close to finish. ERROR = nothing open.
+    at("AT+QMTCLOSE=0", "+QMTCLOSE:", NULL, NULL, 5000);
+
     AT("AT+QMTCFG=\"version\",0,4"); // MQTT 3.1.1
     AT("AT+QMTCFG=\"pdpcid\",0,1");
     AT("AT+QMTCFG=\"keepalive\",0," STR(CONFIG_GX5_MQTT_KEEPALIVE_S));
     AT("AT+QMTCFG=\"session\",0,0"); // persistent: broker queues QoS1 cmds while we sleep
-    snprintf(cmd, sizeof cmd, "AT+QMTCFG=\"will\",0,1,1,1,\"device/%s/%s/status/connected\",\"offline\"", s_id, s_loc);
+    // Unprovisioned, the broker allows discovery/<id> and nothing else: no last will.
+    // The will is first set with QoS 0 / no retain, then switched off. Switching it off
+    // alone made the broker drop the CONNECT unanswered (bench 2026-11-16); probably the
+    // modem kept the earlier will QoS and retain bits, which MQTT forbids without a will.
+    if (b == &s_boot) {
+        AT("AT+QMTCFG=\"will\",0,1,0,0,\"x\",\"x\"");
+        strcpy(cmd, "AT+QMTCFG=\"will\",0,0");
+    } else snprintf(cmd, sizeof cmd, "AT+QMTCFG=\"will\",0,1,1,1,\"device/%s/%s/status/connected\",\"offline\"", s_id, s_loc);
     AT(cmd);
     if (b->tls) {
         AT("AT+QSSLCFG=\"seclevel\",0," STR(CONFIG_GX5_MQTT_TLS_SECLEVEL));
@@ -224,7 +275,6 @@ static bool mqtt_connect(const gx5_broker_t *b)
     } else {
         AT("AT+QMTCFG=\"ssl\",0,0");
     }
-    at("AT+QMTCLOSE=0", NULL, NULL, NULL, 2000); // stale socket from before sleep; may fail
 
     snprintf(cmd, sizeof cmd, "AT+QMTOPEN=0,\"%s\",%d", b->host, b->port);
     if (!at(cmd, "+QMTOPEN:", line, NULL, 75000) || gx5_last_int(line) != 0) {
@@ -239,8 +289,12 @@ static bool mqtt_connect(const gx5_broker_t *b)
         ESP_LOGE(TAG, "broker rejected connect: %s", line);
         return false;
     }
-    // Commands: device/<id> (this device) and location/<location> (every device there).
     // +QMTSUB: <client>,<msgid>,<result>,<value>
+    if (b == &s_boot) { // the login arrives on the topic we announce on
+        snprintf(cmd, sizeof cmd, "AT+QMTSUB=0,1,\"discovery/%s\",1", s_id);
+        return at(cmd, "+QMTSUB:", line, NULL, 15000) && sscanf(line, "+QMTSUB: %*d,%*d,%d", &result) == 1 && result == 0;
+    }
+    // Commands: device/<id> (this device) and location/<location> (every device there).
     snprintf(cmd, sizeof cmd, "AT+QMTSUB=0,1,\"device/%s\",1", s_id);
     if (!at(cmd, "+QMTSUB:", line, NULL, 15000) || sscanf(line, "+QMTSUB: %*d,%*d,%d", &result) != 1 || result) return false;
     snprintf(cmd, sizeof cmd, "AT+QMTSUB=0,2,\"location/%s\",1", s_loc);
@@ -256,11 +310,16 @@ static portMUX_TYPE s_fix_mux = portMUX_INITIALIZER_UNLOCKED;
 static void refresh_fix(void)
 {
     char line[LINE_LEN] = "", fix[sizeof s_fix] = "";
-    if (!at("AT+QGPSLOC=2", "+QGPSLOC:", line, NULL, 2000) || !gx5_fix_json(line, fix, sizeof fix)) {
+    long long t = 0;
+    if (!at("AT+QGPSLOC=2", "+QGPSLOC:", line, NULL, 2000) || !gx5_fix_json(line, fix, sizeof fix, &t)) {
         fix[0] = '\0';
         at("AT+QGPS?", "+QGPS:", line, NULL, 2000); // 1 = receiver running, just no fix yet
     }
     ESP_LOGI(TAG, "gnss %s", fix[0] ? fix + 1 : line[0] ? line : "no answer");
+    if (fix[0] && t) { // GPS time: the clocks follow every fix
+        int64_t utc = t;
+        esp_event_post(GX5_EVENT, GX5_EV_TIME, &utc, sizeof utc, 0);
+    }
     portENTER_CRITICAL(&s_fix_mux);
     strcpy(s_fix, fix);
     portEXIT_CRITICAL(&s_fix_mux);
@@ -280,12 +339,15 @@ static void refresh_fix(void) {}
 size_t gx5_gnss_fix(char *out, size_t size) { return 0; }
 #endif
 
-// Network time -> GX5_EV_TIME; the application sets the clocks.
+// Network time -> GX5_EV_TIME; the application sets the clocks. GPS time (refresh_fix)
+// does the same whenever there is a fix.
 static void sync_time(void)
 {
     char line[LINE_LEN];
     long long t;
-    if (!at("AT+CCLK?", "+CCLK:", line, NULL, 2000) || !gx5_parse_cclk(line, &t)) return;
+    bool ok = at("AT+CCLK?", "+CCLK:", line, NULL, 2000) && gx5_parse_cclk(line, &t);
+    ESP_LOGI(TAG, "time %s%s", line, ok ? "" : " (not used)");
+    if (!ok) return;
     int64_t utc = t;
     esp_event_post(GX5_EVENT, GX5_EV_TIME, &utc, sizeof utc, 0);
 }
@@ -302,6 +364,84 @@ static void publish(const char *topic, const msg_t *m)
     if (strstr(topic, "/telemetry")) refresh_fix();                    // for the next one
 }
 
+// ── OTA ─────────────────────────────────────────────────────────────────────
+// The modem downloads the image into its own file system (AT+QHTTPGET +
+// QHTTPREADFILE), then it is pulled across in 1 KB pieces (AT+QFREAD) and written
+// to the other app slot. Pulling keeps the UART from overrunning during flash writes.
+static volatile bool s_ota;
+
+// AT+QFREAD=<fh>,<n> -> "CONNECT <got>\r\n" <got raw bytes> "\r\nOK". Returns got, -1 on error.
+static int file_read(int fh, uint8_t *buf, int n)
+{
+    char cmd[40], line[LINE_LEN];
+    int got = -1;
+    uint8_t lf;
+    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(5000);
+    snprintf(cmd, sizeof cmd, "AT+QFREAD=%d,%d\r", fh, n);
+    uart_write_bytes(UART, cmd, strlen(cmd));
+    while (read_line(line, sizeof line, deadline)) {
+        if (sscanf(line, "CONNECT %d", &got) == 1) break;
+        if (strstr(line, "ERROR")) return -1;
+    }
+    if (got < 0 || got > n || uart_read_bytes(UART, &lf, 1, pdMS_TO_TICKS(500)) != 1 || lf != '\n') return -1;
+    if (uart_read_bytes(UART, buf, got, pdMS_TO_TICKS(3000)) != got) return -1;
+    while (read_line(line, sizeof line, deadline))
+        if (!strcmp(line, "OK")) return got;
+    return -1;
+}
+
+// Returns why it failed; on success the device restarts into the new image.
+static const char *ota(const char *ver)
+{
+    static uint8_t buf[1024];
+    char url[200], cmd[64], line[LINE_LEN];
+    int err = -1, code = 0, size = 0, fh = -1, done = 0;
+    esp_ota_handle_t h;
+    const esp_partition_t *part = esp_ota_get_next_update_partition(NULL);
+    const char *why = NULL;
+
+    if (!part) return "no-ota-slot";
+    int n = snprintf(url, sizeof url, CONFIG_GX5_OTA_URL "/fw/" CONFIG_GX5_PRODUCT_ID "-%s.bin?id=%s&v=%s", ver, s_id, esp_app_get_description()->version);
+    if (n >= (int)sizeof url) return "url-too-long";
+    ESP_LOGI(TAG, "ota %s", url);
+    AT("AT+QHTTPCFG=\"contextid\",1");
+    AT("AT+QHTTPCFG=\"responseheader\",0"); // body only
+    snprintf(cmd, sizeof cmd, "AT+QHTTPURL=%d,30", n);
+    if (!at(cmd, NULL, NULL, url, 35000)) return "url-rejected";
+    // +QHTTPGET: <err>[,<http status>[,<content length>]]
+    if (!at("AT+QHTTPGET=80", "+QHTTPGET:", line, NULL, 90000) || sscanf(line, "+QHTTPGET: %d,%d,%d", &err, &code, &size) < 2 || err || code != 200) {
+        ESP_LOGE(TAG, "ota: %s", line);
+        return code == 404 ? "no-such-firmware" : "download-failed";
+    }
+    if (size <= 0 || size > (int)part->size) return "bad-size";
+    at("AT+QFDEL=\"ota.bin\"", NULL, NULL, NULL, 5000); // left over from a failed try; may fail
+    if (!at("AT+QHTTPREADFILE=\"ota.bin\",80", "+QHTTPREADFILE:", line, NULL, 900000) || gx5_last_int(line) != 0) return "download-failed";
+    if (!at("AT+QFOPEN=\"ota.bin\",2", "+QFOPEN:", line, NULL, 5000) || sscanf(line, "+QFOPEN: %d", &fh) != 1) return "file-open-failed";
+
+    if (esp_ota_begin(part, size, &h) != ESP_OK) {
+        why = "flash-begin-failed";
+    } else {
+        while (done < size) {
+            int got = file_read(fh, buf, size - done < (int)sizeof buf ? size - done : (int)sizeof buf);
+            if (got <= 0 || esp_ota_write(h, buf, got) != ESP_OK) break;
+            done += got;
+            if (done % (64 * 1024) < got) ESP_LOGI(TAG, "ota %d / %d", done, size);
+        }
+        if (done != size) {
+            esp_ota_abort(h);
+            why = "transfer-failed";
+        } else if (esp_ota_end(h) != ESP_OK) { // checks the image (magic, checksum, SHA-256)
+            why = "bad-image";
+        } else if (esp_ota_set_boot_partition(part) != ESP_OK) {
+            why = "set-boot-failed";
+        }
+    }
+    snprintf(cmd, sizeof cmd, "AT+QFCLOSE=%d", fh);
+    AT(cmd);
+    AT("AT+QFDEL=\"ota.bin\"");
+    return why;
+}
+
 // 'm' = message in *m, 'u' = UART activity, 0 = timeout. Queues are only ever
 // read through the set (FreeRTOS requirement).
 static int wait_any(msg_t *m, TickType_t ticks)
@@ -312,6 +452,9 @@ static int wait_any(msg_t *m, TickType_t ticks)
     if (h == s_uartq) return xQueueReceive(s_uartq, &e, 0) ? 'u' : 0;
     return 0;
 }
+
+static const char *why_here(void);
+static void announce(const char *reason);
 
 // Connected: sleep until the modem (RI pulse / UART) or the app wants something.
 static void serve(void)
@@ -335,10 +478,26 @@ static void serve(void)
         }
         if (w == 'u') {
             while (read_line(line, sizeof line, xTaskGetTickCount() + pdMS_TO_TICKS(100))) urc(line);
+        } else if (m.type == M_PUB && s_provisioning) {
+            announce(why_here()); // telemetry tick: still here, still waiting for a login
         } else if (m.type == M_PUB) {
             char topic[96];
             full_topic(topic, sizeof topic, m.topic);
             publish(topic, &m);
+        } else if (m.type == M_OTA) {
+            char topic[96];
+            msg_t r = {.type = M_PUB};
+            s_ota = true;
+            const char *why = ota(m.data);
+            s_ota = false;
+            ESP_LOGW(TAG, "ota %s", why ? why : "done, restarting");
+            snprintf(r.data, sizeof r.data, "{\"ev\":\"ota\",\"version\":\"%.15s\",\"result\":\"%s\"}", m.data, why ? why : "ok");
+            full_topic(topic, sizeof topic, "event");
+            publish(topic, &r);
+            if (!why) {
+                at("AT+QMTDISC=0", "+QMTDISC:", NULL, NULL, 5000);
+                esp_restart();
+            }
         } else if (m.type == M_STOP || m.type == M_RECONNECT) {
             break;
         }
@@ -346,20 +505,37 @@ static void serve(void)
     if (held) esp_pm_lock_release(s_awake);
 }
 
+// GNSS off, confirmed: left on it searches at ~42 mA and the modem never sleeps. The
+// first AT+QGPSEND after the last publish got no answer (bench 2026-11-19), so ask again.
+static void gnss_off(void)
+{
+    char line[LINE_LEN];
+    for (int i = 0; i < 5; i++) {
+        at("AT+QGPSEND", NULL, NULL, NULL, 3000);
+        line[0] = '\0';
+        if (at("AT+QGPS?", "+QGPS:", line, NULL, 2000) && strstr(line, "+QGPS: 0")) return;
+    }
+    ESP_LOGE(TAG, "GNSS still on");
+}
+
 static void park(void)
 {
     esp_pm_lock_acquire(s_awake);
     vTaskDelay(pdMS_TO_TICKS(300)); // let an aborted command finish talking
     uart_flush_input(UART);
+    // End the session first, also before the radio goes off: a link that just drops makes
+    // the broker publish our will ("offline") over the status we sent last.
+    if (s_session) log_network(); // signal at the end too: just after registering it reads -125,0,8,0 (not measured yet)
+    if (s_session) at("AT+QMTDISC=0", "+QMTDISC:", NULL, NULL, DISC_MS); // never connected: no URC comes, time wasted
+    s_session = false;
+    gnss_off();
     if (s_stop == 2) {
-        if (!sync_at(2)) ESP_LOGI(TAG, "modem already off");
-        else if (!at("AT+QPOWD=1", "POWERED DOWN", NULL, NULL, 10000)) ESP_LOGE(TAG, "modem did not confirm power down");
-    } else {
-        if (s_session) at("AT+QMTDISC=0", "+QMTDISC:", NULL, NULL, 5000); // never connected: no URC comes, 5 s wasted
-        s_session = false;
-        AT("AT+QGPSEND");                                   // GNSS off, or the modem never sleeps
-        AT("AT+QSCLK=1");                                   // modem sleeps when idle, stays registered
+        // Not AT+QPOWD: the card confirms it, then starts again by itself ~6 s later and
+        // runs awake all through the sleep (bench 2026-11-19: LiPo flat in 5.5 h).
+        AT("AT+QCFG=\"ledmode\",1"); // net LED off while the radio is off; the default mode blinks it every 2 s all through the sleep
+        if (!at("AT+CFUN=0", NULL, NULL, NULL, 15000)) ESP_LOGE(TAG, "modem radio not off"); // deregisters
     }
+    AT("AT+QSCLK=1"); // modem sleeps when idle; registered unless the radio is off
     uart_wait_tx_done(UART, pdMS_TO_TICKS(200));
     esp_pm_lock_release(s_awake);
 }
@@ -381,6 +557,8 @@ static void load_broker(void)
     nvs_close(h);
 }
 
+static const char *why_here(void) { return s_have_stored ? "broker-unreachable" : "unprovisioned"; }
+
 // Tell whoever runs this broker who we are and why we are here:
 // discovery/<id> on the bootstrap broker, device/<id>/<location>/event otherwise.
 static void announce(const char *reason)
@@ -389,7 +567,7 @@ static void announce(const char *reason)
     char topic[96];
     if (s_provisioning) snprintf(topic, sizeof topic, "discovery/%s", s_id);
     else full_topic(topic, sizeof topic, "event");
-    snprintf(m.data, sizeof m.data, "{\"id\":\"%s\",\"fw\":\"%s\",\"reason\":\"%s\"}", s_id, esp_app_get_description()->version, reason);
+    snprintf(m.data, sizeof m.data, "{\"id\":\"%s\",\"hw\":\"" CONFIG_GX5_PRODUCT_ID "\",\"fw\":\"%s\",\"reason\":\"%s\"}", s_id, esp_app_get_description()->version, reason);
     publish(topic, &m);
 }
 
@@ -408,10 +586,16 @@ static void modem_task(void *arg)
             if (s_loc_dirty) load_loc();
             esp_pm_lock_acquire(s_awake);
             s_abortable = true;
+            // Reconnecting with a session still open (a login arrived, the broker changed):
+            // end it before bringup() drops the data context under it. After that the modem
+            // refuses DISC, never finishes CLOSE, and the next open fails (bench 2026-11-17).
+            if (s_session) at("AT+QMTDISC=0", "+QMTDISC:", NULL, NULL, DISC_MS);
+            s_session = false;
             bool net = bringup(); // the network comes first: no broker is reachable without it
             ESP_LOGI(TAG, "network %s", net ? "up" : "down");
             if (net) {
                 log_network();
+                sync_time(); // network time needs the cell, not a broker
                 refresh_fix();
             }
             bool up = false;
@@ -445,9 +629,8 @@ static void modem_task(void *arg)
                 backoff_s = 5;
                 s_provisioning = b == &s_boot;
                 s_connected = s_session = true;
-                sync_time();
                 if (note) announce(note);
-                else if (s_provisioning) announce(s_have_stored ? "broker-unreachable" : "unprovisioned");
+                else if (s_provisioning) announce(why_here());
                 note = NULL;
                 esp_event_post(GX5_EVENT, GX5_EV_MQTT_CONNECTED, NULL, 0, portMAX_DELAY);
                 serve();
@@ -482,6 +665,9 @@ bool gx5_mqtt_publish(const char *subtopic, const char *payload, bool retain)
 {
     msg_t m = {.type = M_PUB, .retain = retain};
     if (!s_connected) return false;
+    // Unprovisioned, only discovery/<id> may be published: each telemetry tick becomes
+    // a repeat of the announcement (serve) and everything else is dropped.
+    if (s_provisioning && strcmp(subtopic, "telemetry")) return false;
     strlcpy(m.topic, subtopic, sizeof m.topic);
     strlcpy(m.data, payload, sizeof m.data);
     return xQueueSend(s_msgq, &m, pdMS_TO_TICKS(2000)) == pdTRUE; // brief wait rides out a burst
@@ -489,10 +675,24 @@ bool gx5_mqtt_publish(const char *subtopic, const char *payload, bool retain)
 
 bool gx5_mqtt_provisioning(void) { return s_provisioning; }
 
+void gx5_ota_start(const char *version)
+{
+    msg_t m = {.type = M_OTA};
+    strlcpy(m.data, version, sizeof m.data);
+    if (s_connected) xQueueSend(s_msgq, &m, pdMS_TO_TICKS(1000));
+}
+
+bool gx5_ota_busy(void) { return s_ota; }
+
 void gx5_broker_set(const gx5_broker_t *b)
 {
     msg_t m = {.type = M_RECONNECT};
     s_cand = *b;
+    if (!s_cand.host[0]) { // a login only: it is for the bootstrap broker itself
+        strcpy(s_cand.host, s_boot.host);
+        s_cand.port = s_boot.port;
+        s_cand.tls = s_boot.tls;
+    }
     s_have_cand = true; // set last: the modem task reads s_cand only after this
     xQueueSend(s_msgq, &m, pdMS_TO_TICKS(1000));
 }

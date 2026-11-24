@@ -4,6 +4,7 @@
 __pycache__/
 docs/references/SCH_*.pdf
 build/
+build-*/
 sdkconfig
 sdkconfig.old
 managed_components/

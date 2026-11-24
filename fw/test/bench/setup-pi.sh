@@ -7,7 +7,7 @@ U=${SUDO_USER:?run with sudo}
 H=$(getent passwd "$U" | cut -d: -f6)
 
 apt-get update
-apt-get install -y git nodejs npm build-essential can-utils i2c-tools \
+apt-get install -y git nodejs npm build-essential can-utils i2c-tools mosquitto-clients \
     python3-serial python3-can python3-smbus2 python3-pytest
 
 # Hat wiring (schematic "rPI CAN Device Tester" rev 1.0):
@@ -76,6 +76,50 @@ KillMode=mixed
 WantedBy=multi-user.target
 EOF
 
+# Soak logger (soak.py, copied to ~/gx5s-bench with test_bench.py). Not enabled:
+# start it for a long run, stop it before running pytest (both drive the hat).
+cat >/etc/systemd/system/gx5s-soak.service <<EOF
+[Unit]
+Description=GX5s soak logger (supply current, wake and sleep events)
+After=esp32-workbench.service
+
+[Service]
+User=$U
+WorkingDirectory=$H/gx5s-bench
+ExecStart=/usr/bin/python3 -u soak.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# MQTT capture: every message the broker lets this login see, one line each (time,
+# topic, payload), appended to ~/mqtt-capture/messages.log for later analysis. The
+# login is ~/.config/reactiot/mqtt-monitor.env (MQTT_HOST, MQTT_PORT, MQTT_USER,
+# MQTT_PASS; keep it mode 600); the service does nothing until that file exists. The
+# capture can hold provisioning messages, which carry broker credentials: it is
+# written owner-only.
+cat >/etc/systemd/system/gx5s-mqtt-capture.service <<EOF
+[Unit]
+Description=GX5s MQTT capture (all device messages, for later analysis)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=$H/.config/reactiot/mqtt-monitor.env
+
+[Service]
+User=$U
+UMask=0077
+EnvironmentFile=$H/.config/reactiot/mqtt-monitor.env
+ExecStartPre=/bin/mkdir -p $H/mqtt-capture
+ExecStart=/bin/sh -c 'exec mosquitto_sub -h "\$\$MQTT_HOST" -p "\$\$MQTT_PORT" -u "\$\$MQTT_USER" -P "\$\$MQTT_PASS" -i bench-monitor -t "device/#" -t "discovery/#" -t "location/#" -F "%%I %%t %%p" >>$H/mqtt-capture/messages.log'
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
 systemctl daemon-reload
-systemctl enable can0.service esp32-workbench.service
+systemctl enable can0.service esp32-workbench.service gx5s-mqtt-capture.service
 echo "Done. Reboot, then check: ip -br link show can0; i2cdetect -y 1; curl localhost:4000/api/ports"

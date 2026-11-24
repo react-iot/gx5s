@@ -29,31 +29,78 @@ Status: accepted (2026-11-15)
    |---|---|---|---|---|
    | RUN | 80 MHz + auto light sleep | MQTT connected | ignition on | — |
    | LINGER | same | MQTT connected | ignition off / timer or RI wake | — |
-   | SLEEP | deep sleep | registered, `QSCLK=1`, GNSS off | linger or connect timeout expired | ignition (ext0), RI or motion (ext1), heartbeat timer |
-   | PROTECT | deep sleep | powered down (`QPOWD`) | supply below cutoff | ignition (only if off), recheck timer |
+   | SLEEP | deep sleep | registered, `QSCLK=1`, GNSS off | linger or connect timeout expired | ignition wire or CAN traffic (ext0), RI or motion (ext1), heartbeat timer |
+   | HIBERNATE | deep sleep | radio off (`CFUN=0`), `QSCLK=1`, GNSS off | as SLEEP, when `GX5_HIBERNATE=y` | ignition wire or CAN traffic (ext0), motion (ext1), heartbeat timer |
+   | PROTECT | deep sleep | radio off (`CFUN=0`), `QSCLK=1`, GNSS off | supply below cutoff | ignition (only if off), recheck timer |
 
-   In both sleep states the regulator is in power-save mode, the charger is off and
+   In all sleep states the regulator is in power-save mode, the charger is off and
    the harness feed is off, so the board lives on its LiPo and draws ~0.15 mA from
    the vehicle (11.4 mA with feed and normal mode left on). The feed stays on
    (6.6 mA) only when the LiPo is below `GX5_BAT_MIN_MV` or missing: with neither
    supply the MCU would brown out, the buck enable would float back on and the board
    would reboot in a loop. Bench 2026-11-15: a modem URC (RI pulse) woke the board
-   from SLEEP (`wake=modem`) and the modem answered at once. But the modem card
-   still costs ~16 mA at 12 V (feed on) when asleep and registered, against 6.6 mA
-   for the board alone, so on the LiPo it will not last long; eDRX/PSM not tried yet. The battery-sense divider alone (R8 1K + R5 1.2K across the LiPo,
+   from SLEEP (`wake=modem`) and the modem answered at once. The battery-sense divider alone (R8 1K + R5 1.2K across the LiPo,
    schematic sheet 2) takes ~1.9 mA from it at all times. Both ADC readings go
    through the chip's factory calibration (eFuse Vref).
+
+   **The modem card decides the sleep current (bench 2026-11-19 to 21).**
+   - *No power-down.* The BG96 Mini PCIe card has no power-key pin and holds the module's
+     power key low itself. After `AT+QPOWD` (`POWERED DOWN`) or a PSM entry
+     (`PSM POWER DOWN`) it boots again about 6 s later, with only 3.3 V, UART and reset
+     attached, whatever the host does with UART TX/RX, `PERST#` or DTR. Measured at 3.3 V:
+     the current goes from idle straight to boot current (~70 mA), never down. So the
+     firmware never sends `QPOWD`, and sends `AT+CPSMS=0` at every modem start: a stored
+     PSM setting makes the card restart in a loop (every 129 s with no service).
+   - *Sleep needs the card's USB-detect link removed.* On the card the module's `USB_VBUS`
+     is tied to 3.3 V, so the module always sees USB attached and never reaches real
+     sleep: 36 mA awake and 31 mA "asleep" at 3.3 V (radio off, GNSS off, `QSCLK=1`, DTR
+     high). `AT+QCFGEXT="disusb",1` and `"usb/psm",1` change nothing. With the link
+     resistor removed (underside, beside the SIM holder, under module pins 8-10) the same
+     card draws 13.8 mA awake and under 1 mA asleep.
+   - *Board asleep at 12 V, feed on, no LiPo:* unmodified card 20.5 mA; modified card
+     8.5 mA; no card 6.4 mA. Registered sleep (SLEEP) and radio-off sleep (HIBERNATE)
+     cost the same on an unmodified card. For comparison the GX5sV2 build of 2022-10
+     slept at 42.8 mA on the same board.
+   - *The rest is the 5 V buck.* The TPS5430 draws 2 mA (typ, 4.4 max) before it switches
+     and has no light-load mode; with the feed off the harness draws 0.15 mA.
+   - Before the radio-off sleep the firmware sets `AT+QCFG="ledmode",1`: in the default
+     mode the net LED flashes every 2 s all through the sleep.
+   - `GX5_MODEM_AT_LOG=y` logs every modem command and reply (credentials cut).
 
 6. **Never drain the supply.** `VCC < GX5_VCC_CUTOFF_MV` for 3 consecutive samples
    (or once, on a wake with ignition off) forces PROTECT. Leaving PROTECT needs
    `cutoff + GX5_VCC_HYST_MV`. With ignition off, the awake window is always bounded
    (`GX5_CONNECT_TIMEOUT_S`, `GX5_LINGER_S`). A reading below `GX5_VCC_ABSENT_MV`
    means no harness supply (USB / LiPo bench power) and disables protection.
+   The cutoff defaults to 11.0 V, as in GX5sV2 (`vccLow = 11`). It was 11.8 V until
+   the soak of 2026-11-17: with the hat measuring 12.1 V the board read 11.5 V while
+   the LiPo charged (~340 mA) and went to PROTECT with ignition on, then stayed there
+   30 minutes because 12.09 V was under cutoff + hysteresis. Where the ~0.6 V goes is
+   not found yet; until it is, the cutoff acts that much early whenever the charger runs.
+   The same run showed the charger switching every 5 s tick (on: reading under the
+   cutoff; off: reading back above it), so it now stops below the cutoff and starts
+   again only above cutoff + hysteresis. Not yet run on hardware.
+   The LiPo is measured only with the charger off: charging lifted the reading by
+   ~0.4 V in that run (3787 mV at wake, 4167 mV seconds later), and the "keep the
+   feed on" decision before sleep was made on the lifted value. Before sleep the
+   charger is now stopped first (200 ms to settle, not measured); telemetry `bat_mv`
+   is the last charger-off reading, so it does not move while the LiPo charges.
+   The charger stops only after the modem is parked: stopped before the last publish,
+   with the LiPo at 3.4 V, the modem went silent (`AT+QMTPUB -> no response`, then
+   `modem park timed out`; bench 2026-11-18). The same bench showed the supply reading
+   0.8-1.0 V under the hat (11.2-11.4 V against 12.2 V) while charging a flat LiPo.
 7. **Light sleep while online** needs the modem to announce URCs on RI
    (`urc/ri/other` pulse + `urc/delay`), since UART bytes are lost in light sleep and
    ESP32 UART wake only works on IO_MUX pins. `GX5_LIGHT_SLEEP=n` turns it off.
+   Every modem command holds the no-light-sleep lock for its whole exchange (in `at()`
+   itself, not in the callers). Bench 2026-11-17: the announcement sent right after
+   connecting ran without the lock; with ignition off (CAN is off, so nothing else holds
+   one) the MCU slept between the modem's `OK` and its `+QMTPUB:`, lost that reply and
+   every incoming message, declared the link dead and reconnected, which the broker
+   logged as "Duplicate Client ID". With ignition on, CAN's lock hid it.
 8. **Provisioning.** The broker is not compiled in. Firmware carries only a
-   *bootstrap* broker (menuconfig). Selection each connect: candidate > stored (NVS
+   *bootstrap* broker (menuconfig; default `mqtt.reactiot.com.au:1883`, no TLS, so the
+   provisioning message and the credentials in it travel unencrypted). Selection each connect: candidate > stored (NVS
    `gx5/broker`) > bootstrap.
    - Device id = factory MAC with the last byte + 3, as `AA:BB:CC:DD:EE:FF`, printed in a startup banner.
    - Bootstrap connects anonymously (no username/password), client id = device id, so
@@ -68,16 +115,42 @@ Status: accepted (2026-11-15)
      retained status under the old location is not cleared. There is no site id in
      the topics: provisioning decides which broker a device belongs to.
    - Backend answers on `device/<id>` with one provisioning message:
-     `{"provision":{"pop":"<PIN>","broker":{"host","port","user","pass","tls"},"config":{"location":"0001","can":{..}}}}`.
+     `{"provision":{"pop":"<PIN>","broker":{"host","port","user","pass","tls"},"config":{"location":"0001","vehicle":{..}}}}`.
      `pop` is a proof-of-possession PIN in the style of ESP BLE provisioning: the last
      three bytes of the device id as one decimal number, 8 digits
      (`C4:DD:57:E0:9F:AF` -> `14720943`); it is also printed in the startup banner.
      A wrong or missing PIN, or a bare `{"broker":..}`, changes nothing and publishes
      `event` `provision-rejected`. `config` is applied first (today: `location` and
-     the `can` object), then the broker is tried at once and stored **only if the connection
+     one vehicle-profile message), then the broker is tried at once and stored **only if the connection
      succeeds**; otherwise the device returns to the broker it came from and
      publishes `event` `broker-change-failed`. Messages may be up to 511 bytes.
    - The same message on the production broker re-provisions.
+   - **Login on the bootstrap broker itself** (the `mqtt.reactiot.com.au` broker,
+     2026-11-16). That broker lets an anonymous device use `discovery/<id>` and nothing
+     else, so on the bootstrap broker the firmware sets no last will, subscribes only
+     `discovery/<id>`, publishes nothing but the announcement
+     (`{"id","hw","fw","reason"}`, repeated on every telemetry tick) and drops the rest.
+     The answer comes on the same topic:
+     `{"cmd":"config","location":"0001","user":"<id>","pass":"<secret>"}`. Location,
+     user and password are all required; a `site` is ignored (no site id in the topics).
+     The device keeps host, port and TLS of the bootstrap broker, tries the login at
+     once and stores it only if it connects. No PIN: the broker only lets the owner of
+     a client id read `discovery/<id>`, and the client id is self-asserted, so anyone
+     connecting as a device's id could read its secret. Bench 2026-11-16: the anonymous connect and the
+     `discovery/<id>` subscription work (`MQTT connected … (bootstrap)`). Switching the
+     will off needs two steps (set it with QoS 0 / no retain, then off): switched off
+     alone, the broker dropped the CONNECT unanswered. Bench 2026-11-17 (ignition off):
+     the board announced, took the login, disconnected, connected with it
+     (`MQTT connected to mqtt.reactiot.com.au`, no `(bootstrap)`) and after a reset
+     connected with the stored login directly. Two faults had to go first:
+     - A reconnect with a session still open (the login arriving is one) must send
+       `AT+QMTDISC` **before** `bringup()`, which resets the data context
+       (`AT+QIDEACT`). After the reset the modem answers DISC with ERROR, never finishes
+       `AT+QMTCLOSE`, and refuses the next open with `+QMTOPEN: 0,2` (client identifier
+       occupied); the login was then dropped as "new broker unreachable".
+     - DISC waits 15 s for `+QMTDISC:`, not 5 s. Once the 5 s wait gave up at sleep time
+       and the board woke again 2 s later with `wake=modem`. Confirmations measured
+       since: 1.4 to 2.3 s.
    - The PIN is derived from the id the device announces, so it stops mistakes
      (provisioning the wrong unit), not an attacker who can read `discovery/#`.
    - `GX5_PROVISION_AFTER_FAILS` consecutive failures to reach the stored broker
@@ -110,7 +183,13 @@ Status: accepted (2026-11-15)
      states (the regulator only changes mode). Latched INT on the GPIO12 strap is a known risk on
      modules without the flash-voltage eFuse (see `GX5_MOTION_WAKE` help).
    - **PCF8563**: sets the system clock at boot if valid; rewritten from network
-     time (`AT+CCLK?`, `AT+CTZU=1`) on every connect. Telemetry `ts` is 0 until then.
+     time (`AT+CCLK?`, `AT+CTZU=1`) each time the network comes up (no broker needed). Telemetry `ts` is 0 until then.
+     GPS time does the same on every fix (host-tested only: no fix on the bench).
+     With `CTZU=1` the modem clock is UTC and the zone suffix is not applied (bench:
+     `19:21:05+32` at 19:21:04 UTC in a UTC+8 zone). Bench 2026-11-16: the Pi sets
+     the RTC 400 days back with the board in reset; it boots with that time
+     (`test_rtc_sets_clock`), then network time corrects the RTC with no broker
+     (`test_network_time_sets_rtc`).
    - **CAN**: see §10.
    - **SD NAND**: offline telemetry queue (`/sd/queue.txt` + offset file). Powered
      and mounted per operation. GPIO2 supplies the NAND directly, so it is driven at
@@ -121,29 +200,80 @@ Status: accepted (2026-11-15)
      telemetry, live and offline, so it can be up to one interval old. Stopped
      (`QGPSEND`) before SLEEP. The log shows operator, cell and signal
      (`AT+COPS?`, `AT+QNWINFO`, `AT+QCSQ`) on every bring-up.
-10. **CAN** (`gx5_can`, protocol logic in `gx5_proto/canproto.h`). Plain C with
-    fixed-size state (no heap).
-    - Runs only while ignition is on. The TWAI driver holds a no-light-sleep lock
-      while enabled, so RUN does not light-sleep with CAN on.
-    - Modes: `off`, `listen` (default; never drives the bus), `obd2`, `j1939`. The
-      active modes acknowledge and transmit on the vehicle bus.
-    - Configured over MQTT and kept in NVS (`gx5/can`): `{"can":{mode,bitrate,filter}}`
-      and `{"can_req":{slot,id,data,interval}}` — 16 request slots, each a raw frame
-      sent every `interval` seconds (OBD-II PID request or J1939 PGN request alike).
+10. **CAN and the vehicle profile** (`gx5_can`, protocol logic in
+    `gx5_proto/canproto.h`). Plain C with fixed-size state (no heap).
+    - Modes: `off`, `listen` (never drives the bus), `obd2`, `j1939`. The active modes
+      acknowledge and transmit on the vehicle bus. The TWAI driver holds a
+      no-light-sleep lock while enabled.
+    - **Profile** (NVS `gx5/veh`, about 2 kB; revised 2026-11-24 for OBD-II installs,
+      which have no ACC wire). Four messages, over MQTT or the USB console:
+      `{"vehicle":..}` name, bitrate, ignition rule; `{"pid":..}` a library of 32 raw
+      request frames; `{"sig":..}` 48 numbers decoded on the device from the answers,
+      with the field names of the OBDb signal sets (`bix`, `len`, `mul`, `div`, `add`,
+      `sign`, `blsb`) so a backend can convert those files mechanically;
+      `{"can":{"state":..}}` a mode and a list of (library entry, interval) per state.
+    - **Three states**: `pre` (awake, ignition not seen since the wake), `on`, `off`
+      (awake after ignition off). As shipped `on` listens and the other two keep the bus
+      off, which is the behaviour before the profile existed.
+    - **Ignition source**: `acc` the wire (default), `vcc` supply voltage with two
+      thresholds, `sig` a decoded signal (answered, or at least `min`), `frame` a byte
+      of a broadcast frame (GX5sV2's Kia rule: 0x541 byte 0 = 0x03). `sig` and `frame`
+      turn off when not seen for `hold_s`. This replaces the earlier decision to leave
+      CAN ignition out: it needs the device awake before ignition, so the window is
+      bounded (`pre_s`, then the normal connect and linger limits) and decision 6 still
+      cuts everything off on a low supply.
+    - **Wake on CAN traffic**, as GX5sV2 did it: the SN65HVD230 passes the bus through
+      in standby and CAN-RX (GPIO32) low wakes the chip on ext0. The ESP32's ext1 only
+      does "any high", so CAN-RX cannot join motion and RI there: a profile has either
+      the ACC wire or CAN traffic on ext0, chosen by the ignition source. Not armed when
+      the bus is busy at the moment of sleeping, nor after three CAN wakes in a row that
+      did not lead to ignition (until another wake cause); motion and the heartbeat remain.
+    - **VIN**: the profile names the library request that returns it (`vin_pid`). An
+      RTC-memory flag is lost with power, so at the first ignition on after a power
+      loss the request is sent every 10 s until answered; the VIN is kept in NVS
+      (`gx5/vin`) and reported with the previous one as an `event`.
+    - **Debug mode** (`{"debug":true}`, NVS `gx5/dbg`, `GX5_DBG()` in `gx5.h`): a
+      runtime switch rather than a build, because the vehicle is where it is needed.
+      Covers CAN traffic (one frame per id every 5 s), ignition decisions, supply
+      samples, wake sources and the modem command log.
     - OBD-II: ISO-TP single/first/consecutive frames with flow control, 16-bit PIDs
       for service 0x22, gateway addressing on 0x6xx ids, one request at a time
       (next after completion or 300 ms). Negative responses are dropped.
     - J1939: address claim as 0xF8 (at start and on request), TP.BAM and TP RTS/CTS
-      assembly with end-of-message ACK, optional "requested PGNs only" filter.
+      assembly with end-of-message ACK, optional "library PGNs only" filter.
     - Latest value per (ECU, service, PID) or (PGN, source); only changes are
-      published, to `device/<id>/<location>/can`, as text
+      published to `device/<id>/<location>/can`: decoded signals as
+      `{"sig":{"rpm":1726}}`, answers without a signal as text
       (`7E8 01 0C 1AF8`, `FEEE 00 8C7D..`) inside a JSON array. Limits: 40 values,
-      96 bytes each (longer responses truncated), 4 concurrent multi-frame messages.
-    - Deliberately left out: CAN-based ignition detection (BMW, Toyota, Kia, Ford,
-      Nissan, Hyundai, OBD run-time) and "CAN traffic delays sleep". Both need the
-      device awake with ignition off, which breaks decision 6. Ignition is the ACC wire.
-    - Not done yet: Tesla decoder, ALDL (GM serial), CANopen, raw capture of
-      broadcast frames in `obd2` mode.
+      128 bytes each (longer responses truncated), 4 concurrent multi-frame messages.
+    - **Wake on a supply rise** (`"wake":"vcc"`, `main/ulp/vcc.S`), for OBD-II ports that
+      carry no traffic unless asked (a 2021 Kia Cerato: nothing in listen mode, and the
+      device slept through an engine start). The ULP coprocessor averages 8 ADC readings
+      of the VCC divider four times a second, follows the lowest value of the sleep and
+      wakes the chip after three readings `GX5_VCC_WAKE_MV` above it (first version;
+      see the follower below). On the ESP32 the
+      ULP wake and ext0 exclude each other ("Conflicting wake-up trigger: ext0"), so
+      this replaces the CAN wake for that profile, as it did in GX5sV2. First engine
+      start in the car: asleep at 726 counts, lowest 608 (cranking), woke at 699,
+      ignition on 0.25 s after boot. That fired on the recovery from the cranking
+      dip, so any load dip in a parked car could wake it, and the reading also climbs
+      about 40 mV per degC as the board cools. The base is therefore a slow follower:
+      down one count a second, up one count every 30 s, first reading of the sleep as
+      the start. Only a sustained rise wakes; in this car the alternator added 0.8 V
+      about 13 s after the start. Not yet re-tested in the car in this form.
+    - OBD requests (11-bit ids) are sent 8 bytes long, zero padded: the Cerato ignored
+      3-byte requests that the bench simulator accepted.
+    - **Ignition and trip events**: `ign-on` at once, `trip-start` 6 s later with the
+      profile's trip signals (odometer, fuel, run time), `ign-off` and `trip-end` with
+      their last good values and the trip length. Events wait in RAM (four) for the
+      broker, because a wake's first seconds are offline, and join the stored telemetry
+      if the device sleeps first. A signal's `null` value ("no value", OBDb's nullmax)
+      is dropped: the Cerato's fuel level reads 127.5 L with ignition off.
+    - A state change keeps the CAN node when the mode does not change; restarting it
+      cut off a multi-frame answer and delayed the first odometer by 30 s.
+    - Not done yet: reading the
+      profile back, decoding broadcast frames, signals on gateway-addressed (0x6xx)
+      requests, Tesla decoder, ALDL (GM serial), CANopen.
 11. **Component layout** (`fw/components/`). One component per piece of hardware or
     concern, each with its own public header, `Kconfig` menu and declared dependencies.
 
@@ -174,6 +304,10 @@ Status: accepted (2026-11-15)
     USB console over RFC2217 (`:4001`) for flashing and for the tests. `setup-pi.sh`
     sets the Pi up once; `test_bench.py` (pytest) checks supply reading, ignition,
     CAN receive, the bounded awake window, sleep current and wake on ignition.
+    `ecu_sim.py` plays an engine ECU on the Pi's `can0` (OBD-II service 01 / 09 / 22
+    with ISO-TP, J1939 requests, broadcasts, TP RTS/CTS and BAM) so `obd2` and `j1939`
+    modes can be exercised without a vehicle; its logic is self-checked
+    (`ecu_sim.py check`), but it has not yet been run against a board.
     Bench results 2026-11-15: a plain divider formula read ~10 % high (13.2-13.6 V at
     12.14 V). The ADC node is a 100K/10K divider loaded by the VCC-detect transistor
     Q4; `gx5_vcc_node_to_mv` now models that circuit from the eFuse-calibrated ADC
@@ -215,8 +349,26 @@ Status: accepted (2026-11-15)
     address that answers. The bench hat's INA219 (0x40) reaches the bus through the
     harness wiring and serves as the external test device. No driver for any
     particular external sensor yet. The Pi is a second master on that bus during
-    bench runs; no collisions seen, but nothing prevents them.
+    bench runs and nothing prevents collisions. Soak 2026-11-16 (the Pi reading the
+    INA219 11 times a second): 3 of 5 wakes had an `I2C hardware timeout` that dropped
+    the IMU or the RTC for that wake; cause not proven (one coincided with an I2C error
+    on the Pi). Each transfer is now tried three times before a device is dropped.
+
+16. **OTA** (`gx5_modem`). Flash (16 MB): `nvs` 20 K, `otadata`, two app slots of 4 MB and
+    a 7.9 MB `storage` data partition, unused today (`fw/partitions.csv`). The table
+    cannot be changed by OTA, so the whole flash is laid out now; the image is ~420 K. `{"cmd":"ota","version":"1.4.2"}` (no version = `latest`) makes the modem
+    GET `<GX5_OTA_URL>/fw/<hardware id>-<version>.bin?id=<id>&v=<running>` into its
+    own file system (`AT+QHTTPGET`, `AT+QHTTPREADFILE`); the image is then pulled
+    across in 1 KB pieces (`AT+QFREAD`), written to the other slot, checked
+    (`esp_ota_end`) and booted. Pulling instead of streaming keeps the UART from
+    overrunning while flash is written. The result goes to `event`
+    (`{"ev":"ota","version","result"}`); the device stays awake until it is done.
+    Limits: plain http and no signature, so whoever answers for the host can install
+    firmware; no rollback if the new image boots but misbehaves. Built and flashed,
+    boots from slot 0; **the update itself has never run** (needs a broker connection
+    and an image on the server). AT syntax taken from Quectel's HTTP(S) manual (BG96)
+    and FILE note (BG95 series).
 
 ## Not done (add when needed)
 
-OTA, Tesla / ALDL / CANopen decoders, a protocol for whatever sits on the external UART, SMS parsing.
+Signed or https OTA and rollback, Tesla / ALDL / CANopen decoders, a protocol for whatever sits on the external UART, SMS parsing.

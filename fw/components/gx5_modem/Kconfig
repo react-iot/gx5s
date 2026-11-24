@@ -4,13 +4,16 @@ menu "GX5s modem and MQTT"
         comment "Anonymous, client id = MAC. Used until the backend provisions the real broker"
         config GX5_MQTT_HOST
             string "Bootstrap broker host (name or IP)"
-            default ""
+            default "mqtt.reactiot.com.au"
         config GX5_MQTT_PORT
             int "Broker port"
-            default 8883
+            default 1883
         config GX5_MQTT_TLS
             bool "Bootstrap broker uses TLS (handled by the modem)"
-            default y
+            default n
+            help
+                Off (port 1883), the provisioning message travels unencrypted,
+                including the production broker's username and password.
     endmenu
 
     config GX5_MQTT_KEEPALIVE_S
@@ -24,6 +27,14 @@ menu "GX5s modem and MQTT"
         string "CA cert file on the modem filesystem (upload with AT+QFUPL)"
         default "cacert.pem"
 
+    config GX5_OTA_URL
+        string "Firmware server for OTA: <url>/fw/<hardware id>-<version>.bin"
+        default "http://ota.reactiot.com.au"
+        help
+            Fetched by the modem on {"cmd":"ota","version":"x"}. Over plain http
+            the image is not authenticated: whoever can answer for this host
+            can install firmware.
+
     config GX5_PROVISION_AFTER_FAILS
         int "Fall back to the bootstrap broker after this many failed connects"
         default 5
@@ -36,6 +47,14 @@ menu "GX5s modem and MQTT"
     config GX5_APN
         string "Cellular APN (empty = keep the modem's stored APN)"
         default ""
+
+    config GX5_MODEM_AT_LOG
+        bool "Log every AT command and reply (debugging)"
+        default n
+        help
+            Prints each command sent to the modem (">") and each line it returns ("<").
+            Lines that carry credentials (broker login, APN, received MQTT messages)
+            are cut after the command name.
 
     config GX5_GNSS
         bool "Read the modem's GNSS fix (lat/lon/kmh) for telemetry, live and offline"

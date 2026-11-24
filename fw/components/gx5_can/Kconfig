@@ -1,11 +1,12 @@
 menu "GX5s CAN bus"
     config GX5_CAN
-        bool "CAN bus (OBD-II / J1939) while ignition is on"
+        bool "CAN bus (OBD-II / J1939) and vehicle profile"
         default y
         help
-            Starts in listen-only mode. Mode, bitrate and the request list are
-            set at runtime over MQTT ({"can":..}, {"can_req":..}) and kept in
-            NVS. The CAN driver blocks light sleep while it runs.
+            As shipped it listens while ignition is on. The vehicle profile
+            (requests, decoded signals, a request list per state, the ignition
+            rule) is set at runtime over MQTT or USB and kept in NVS; see
+            fw/README.md. The CAN driver blocks light sleep while it runs.
     config GX5_CAN_BITRATE
         int "Default CAN bitrate (bit/s)"
         depends on GX5_CAN

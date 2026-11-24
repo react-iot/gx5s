@@ -2,11 +2,11 @@
 // Pure and host-testable:
 //   cc -Icomponents/gx5_proto/include test/test_can.c -o test/test_can && test/test_can   (from fw/)
 #pragma once
+#include <stddef.h>
 #include "parse.h"
 
-#define GX5_CAN_VAL_MAX  96   // bytes kept per value (longer responses are truncated)
+#define GX5_CAN_VAL_MAX  128  // bytes kept per value (longer responses are truncated)
 #define GX5_CAN_VALUES   40   // distinct values tracked
-#define GX5_CAN_REQS     16   // scheduled request slots
 #define GX5_CAN_SESSIONS 4    // multi-frame messages being assembled at once
 #define GX5_J1939_ADDR   0xF8 // our J1939 source address
 
@@ -19,20 +19,89 @@ typedef struct {
     uint8_t data[8];
 } gx5_frame_t;
 
-// A frame sent every interval_s while the bus is running. interval_s 0 = empty slot.
-// OBD-II:  id 7DF, data 02 01 0C          (request engine speed)
-// J1939:   id 18EA00F8, data EE FE 00     (request PGN FEEE from address 00)
-typedef struct {
-    gx5_frame_t frame;
-    uint16_t interval_s;
-} gx5_can_req_t;
+// ── Vehicle profile ─────────────────────────────────────────────────────────
+// A library of requests the vehicle answers and of named numbers in the answers,
+// and one request list per state. Requests are raw frames:
+//   OBD-II:  id 7E0, data 02010C           (engine speed)
+//   UDS:     id 7C6, data 0322B002         (Kia cluster: fuel, odometer)
+//   J1939:   id 18EA00F8, data EEFE00      (request PGN FEEE from address 00)
+#define GX5_CAN_CMDS 32 // library: requests
+#define GX5_CAN_SIGS 48 // library: decoded numbers
+#define GX5_CAN_POLL 16 // requests per state
+#define GX5_KEY_LEN  12
+#define GX5_TRIP_KEYS 4 // signals reported with the trip start and end events
+
+enum { GX5_ST_PRE, GX5_ST_ON, GX5_ST_OFF, GX5_ST_N }; // awake before ignition, ignition on, awake after ignition off
+enum { GX5_IGN_ACC, GX5_IGN_VCC, GX5_IGN_SIG, GX5_IGN_FRAME }; // where "ignition on" comes from
 
 typedef struct {
-    uint8_t mode;   // GX5_CAN_*
-    uint8_t filter; // J1939: keep only PGNs that are requested
+    uint8_t cmd; // library request
+    uint16_t ds; // every this many 0.1 s; 0 = empty
+} gx5_can_poll_t;
+
+// A number cut out of an answer, described the way OBDb signal sets do
+// (github.com/OBDb): `len` bits at bit `bix` of the data after the PID, bit 0 being
+// the top bit of the first byte; value = raw * mul + add.
+#define GX5_SIG_SIGNED 1
+#define GX5_SIG_LE     2 // whole bytes, least significant first (OBDb "blsb")
+#define GX5_SIG_NULL   4 // the value `nul` means "no value" and is dropped
+typedef struct {
+    char key[GX5_KEY_LEN]; // published name; "" = empty
+    uint8_t cmd, len, flags;
+    uint16_t bix;
+    float mul, add, nul;
+} gx5_can_sig_t;
+
+typedef struct {
+    uint8_t src;            // GX5_IGN_*
+    uint8_t at, mask, eq;   // FRAME: on while (data[at] & mask) == eq ...
+    uint32_t id;            // ... in the broadcast frame with this id
+    char key[GX5_KEY_LEN];  // SIG: on while this signal is answered with a value >= min
+    float min;
+    uint16_t on_mv, off_mv; // VCC: on at or above on_mv, off below off_mv for hold_s
+    uint16_t hold_s;        // SIG/FRAME: off once the condition has not been seen for this long
+} gx5_ign_cfg_t;
+
+typedef struct {
+    char name[24];
     uint32_t bitrate;
-    gx5_can_req_t req[GX5_CAN_REQS];
+    uint8_t filter;  // J1939: keep only PGNs that are in the library
+    uint16_t pre_s;  // woken by CAN traffic or motion: wait this long for ignition
+    uint8_t vin_cmd; // library request that returns the VIN; >= GX5_CAN_CMDS = none
+    uint8_t wake_vcc; // asleep, wake on a rise of the supply instead of on CAN traffic (the chip cannot do both)
+    char trip[GX5_TRIP_KEYS][GX5_KEY_LEN]; // signals sent with the trip-start and trip-end events
+    gx5_ign_cfg_t ign;
+    gx5_frame_t cmd[GX5_CAN_CMDS]; // dlc 0 = empty
+    gx5_can_sig_t sig[GX5_CAN_SIGS];
+    struct {
+        uint8_t mode; // GX5_CAN_*
+        gx5_can_poll_t poll[GX5_CAN_POLL];
+    } st[GX5_ST_N];
 } gx5_can_cfg_t;
+
+// As shipped: the ACC wire is ignition, CAN listens while it is on.
+static inline void gx5_can_defaults(gx5_can_cfg_t *c, uint32_t bitrate)
+{
+    memset(c, 0, sizeof *c);
+    c->bitrate = bitrate;
+    c->pre_s = 60;
+    c->vin_cmd = 0xFF;
+    c->ign.mask = 0xFF;
+    c->ign.min = -1e30f; // any answer counts
+    c->ign.hold_s = 10;
+    c->st[GX5_ST_ON].mode = GX5_CAN_LISTEN;
+}
+
+typedef struct {
+    int64_t seen_ms; // when the on condition last held; 0 = never
+} gx5_ign_t;
+
+// Last good value of each trip signal: still there for the trip-end event when the
+// vehicle has stopped answering or answers "no value".
+typedef struct {
+    double v[GX5_TRIP_KEYS];
+    bool have[GX5_TRIP_KEYS];
+} gx5_trip_t;
 
 // Latest value. OBD-II: id = ECU CAN id, mode = service, pid. J1939: id = PGN, mode = source address.
 typedef struct {
@@ -181,10 +250,9 @@ static inline bool gx5_obd_feed(gx5_can_state_t *s, const gx5_frame_t *f, gx5_fr
 
 static inline bool gx5_j1939_requested(const gx5_can_cfg_t *cfg, uint32_t pgn)
 {
-    for (int i = 0; i < GX5_CAN_REQS; i++) {
-        const gx5_frame_t *f = &cfg->req[i].frame;
-        if (cfg->req[i].interval_s && f->ext && ((f->id >> 16) & 0xFF) == 0xEA && f->dlc >= 3 &&
-            (uint32_t)(f->data[0] | f->data[1] << 8 | f->data[2] << 16) == pgn)
+    for (int i = 0; i < GX5_CAN_CMDS; i++) {
+        const gx5_frame_t *f = &cfg->cmd[i];
+        if (f->ext && ((f->id >> 16) & 0xFF) == 0xEA && f->dlc >= 3 && (uint32_t)(f->data[0] | f->data[1] << 8 | f->data[2] << 16) == pgn)
             return true;
     }
     return false;
@@ -324,48 +392,325 @@ static inline int gx5_hex(const char *s, uint8_t *out, int max)
     return (int)(len / 2);
 }
 
-// {"can":{"mode":"off|listen|obd2|j1939","bitrate":500000,"filter":false}}
-// Absent fields keep their value. False if there is no "can" object or it is invalid.
-static inline bool gx5_parse_can_cfg(const char *js, gx5_can_cfg_t *cfg)
+// ── Signals and ignition ────────────────────────────────────────────────────
+
+// The stored answer to library request `c`, or NULL. OBD-II/UDS: service and PID of
+// the single-frame request [len][service][pid..], from the ECU addressed (7DF: any).
+// J1939: the requested PGN.
+// ponytail: gateway-addressed (0x6xx) requests are not matched; add when a vehicle needs it.
+static inline gx5_can_val_t *gx5_cmd_val(gx5_can_state_t *s, const gx5_frame_t *c)
 {
-    static const char *modes[] = {"off", "listen", "obd2", "j1939"};
-    char mode[8];
-    const char *o = gx5_json_val(js, "can"), *p;
-    if (!o || *o != '{' || !gx5_json_str(o, "mode", mode, sizeof mode)) return false;
-    if (mode[0]) {
-        int m = 0;
-        while (m < 4 && strcmp(mode, modes[m])) m++;
-        if (m == 4) return false;
-        cfg->mode = (uint8_t)m;
+    if (c->dlc < 3) return NULL;
+    uint16_t pid = c->data[1] == 0x22 && c->dlc >= 4 ? (uint16_t)(c->data[2] << 8 | c->data[3]) : c->data[2];
+    for (int i = 0; i < GX5_CAN_VALUES; i++) {
+        gx5_can_val_t *v = &s->val[i];
+        if (!v->used) continue;
+        if (c->ext ? v->id == (uint32_t)(c->data[0] | c->data[1] << 8 | c->data[2] << 16)
+                   : v->mode == c->data[1] && v->pid == pid && (c->id == 0x7DF || v->id == c->id + 8))
+            return v;
     }
-    if ((p = gx5_json_val(o, "bitrate"))) {
-        long b = atol(p);
-        if (b < 10000 || b > 1000000) return false;
-        cfg->bitrate = (uint32_t)b;
+    return NULL;
+}
+
+static inline bool gx5_sig_value(const gx5_can_sig_t *g, const uint8_t *d, size_t n, double *out)
+{
+    uint32_t raw = 0;
+    if (!g->len || g->len > 32 || ((size_t)g->bix + g->len + 7) / 8 > n) return false;
+    if (g->flags & GX5_SIG_LE) {
+        if (g->bix % 8 || g->len % 8) return false;
+        for (int i = g->len / 8 - 1; i >= 0; i--) raw = raw << 8 | d[g->bix / 8 + i];
+    } else {
+        for (int b = g->bix; b < g->bix + g->len; b++) raw = raw << 1 | (d[b / 8] >> (7 - b % 8) & 1);
     }
+    double v = raw;
+    if ((g->flags & GX5_SIG_SIGNED) && (raw >> (g->len - 1) & 1)) v -= (double)(1ULL << g->len);
+    *out = v * g->mul + g->add;
+    if (g->flags & GX5_SIG_NULL) {
+        double d = *out - g->nul;
+        if (d > -0.001 && d < 0.001) return false;
+    }
+    return true;
+}
+
+// The VIN in an answer (09 02: a count byte first; 22 F190: bare; J1939 FEEC: '*' after
+// it): the last 17 letters and digits. False if there are not 17.
+static inline bool gx5_vin_from(const uint8_t *d, size_t n, char out[18])
+{
+    while (n && !((d[n - 1] >= '0' && d[n - 1] <= '9') || (d[n - 1] >= 'A' && d[n - 1] <= 'Z'))) n--;
+    if (n < 17) return false;
+    for (int i = 0; i < 17; i++) {
+        char ch = (char)d[n - 17 + i];
+        if (!((ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'Z'))) return false;
+        out[i] = ch;
+    }
+    out[17] = '\0';
+    return true;
+}
+
+static inline const gx5_can_sig_t *gx5_sig_find(const gx5_can_cfg_t *cfg, const char *key)
+{
+    for (int i = 0; i < GX5_CAN_SIGS; i++)
+        if (cfg->sig[i].key[0] && !strcmp(cfg->sig[i].key, key)) return &cfg->sig[i];
+    return NULL;
+}
+
+// Refresh the trip signals from the stored answers.
+static inline void gx5_trip_update(const gx5_can_cfg_t *cfg, gx5_can_state_t *s, gx5_trip_t *t)
+{
+    for (int i = 0; i < GX5_TRIP_KEYS; i++) {
+        double x;
+        const gx5_can_sig_t *g = cfg->trip[i][0] ? gx5_sig_find(cfg, cfg->trip[i]) : NULL;
+        const gx5_can_val_t *v = g && g->cmd < GX5_CAN_CMDS ? gx5_cmd_val(s, &cfg->cmd[g->cmd]) : NULL;
+        if (v && gx5_sig_value(g, v->data, v->len, &x)) t->v[i] = x, t->have[i] = true;
+    }
+}
+
+// ,"odo_km":78882,"fuel_l":10.5  (each with a leading comma) for the trip signals that have a value.
+static inline void gx5_trip_json(const gx5_can_cfg_t *cfg, const gx5_trip_t *t, char *out, size_t size)
+{
+    size_t n = 0;
+    out[0] = '\0';
+    for (int i = 0; i < GX5_TRIP_KEYS; i++) {
+        if (!cfg->trip[i][0] || !t->have[i]) continue;
+        int len = snprintf(out + n, size - n, ",\"%s\":%.6g", cfg->trip[i], t->v[i]);
+        if (len < 0 || (size_t)len >= size - n) { // does not fit: leave it out
+            out[n] = '\0';
+            return;
+        }
+        n += len;
+    }
+}
+
+// Build {"ts":N,"sig":{"rpm":1726,..}} from signals whose answer changed, starting at
+// signal *next (0 first; call again while it is below GX5_CAN_SIGS). Returns the item
+// count. gx5_sig_sent() afterwards keeps those answers out of the raw list.
+static inline int gx5_sig_chunk(const gx5_can_cfg_t *cfg, gx5_can_state_t *s, long long ts, char *msg, size_t size, int *next)
+{
+    int items = 0, n = snprintf(msg, size, "{\"ts\":%lld,\"sig\":{", ts);
+    for (; *next < GX5_CAN_SIGS; ++*next) {
+        const gx5_can_sig_t *g = &cfg->sig[*next];
+        char item[GX5_KEY_LEN + 32];
+        double x;
+        if (!g->key[0] || g->cmd >= GX5_CAN_CMDS) continue;
+        const gx5_can_val_t *v = gx5_cmd_val(s, &cfg->cmd[g->cmd]);
+        if (!v || !v->updated || !gx5_sig_value(g, v->data, v->len, &x)) continue;
+        int len = snprintf(item, sizeof item, "%s\"%s\":%.6g", items ? "," : "", g->key, x);
+        if ((size_t)n + len + 3 > size) break; // the rest goes in the next message
+        memcpy(msg + n, item, len);
+        n += len;
+        items++;
+    }
+    strcpy(msg + n, "}}");
+    return items;
+}
+
+static inline void gx5_sig_sent(const gx5_can_cfg_t *cfg, gx5_can_state_t *s)
+{
+    for (int i = 0; i < GX5_CAN_SIGS; i++) {
+        gx5_can_val_t *v = cfg->sig[i].key[0] && cfg->sig[i].cmd < GX5_CAN_CMDS ? gx5_cmd_val(s, &cfg->cmd[cfg->sig[i].cmd]) : NULL;
+        if (v) v->updated = false;
+    }
+}
+
+// Ignition from a broadcast frame (FRAME source). Call for every received frame.
+static inline void gx5_ign_frame(const gx5_ign_cfg_t *c, gx5_ign_t *g, const gx5_frame_t *f, int64_t now_ms)
+{
+    if (c->src == GX5_IGN_FRAME && f->id == c->id && c->at < f->dlc && (f->data[c->at] & c->mask) == c->eq) g->seen_ms = now_ms;
+}
+
+// Ignition from an answered signal (SIG source). Call when an answer from `rx_id` completed.
+// ponytail: any answer from that ECU re-checks the last stored value, so a stale value
+// can hold ignition on for one poll interval longer.
+static inline void gx5_ign_answer(const gx5_can_cfg_t *cfg, gx5_can_state_t *s, gx5_ign_t *g, uint32_t rx_id, int64_t now_ms)
+{
+    double x;
+    const gx5_can_sig_t *sig = cfg->ign.src == GX5_IGN_SIG ? gx5_sig_find(cfg, cfg->ign.key) : NULL;
+    const gx5_can_val_t *v = sig && sig->cmd < GX5_CAN_CMDS ? gx5_cmd_val(s, &cfg->cmd[sig->cmd]) : NULL;
+    if (v && v->id == rx_id && gx5_sig_value(sig, v->data, v->len, &x) && x >= cfg->ign.min) g->seen_ms = now_ms;
+}
+
+static inline bool gx5_ign_on(const gx5_ign_cfg_t *c, const gx5_ign_t *g, int64_t now_ms)
+{
+    return g->seen_ms && now_ms - g->seen_ms < c->hold_s * 1000LL;
+}
+
+// ── Commands ────────────────────────────────────────────────────────────────
+
+static inline double gx5_json_num(const char *o, const char *key, double def)
+{
+    const char *p = gx5_json_val(o, key);
+    return p && (*p == '-' || (*p >= '0' && *p <= '9')) ? strtod(p, NULL) : def;
+}
+
+static inline bool gx5_json_flag(const char *o, const char *key, bool def)
+{
+    const char *p = gx5_json_val(o, key);
+    return p ? *p == 't' || *p == '1' : def;
+}
+
+// Index of `name` in a NULL-terminated list, or -1.
+static inline int gx5_pick(const char *name, const char *const *list)
+{
+    for (int i = 0; list[i]; i++)
+        if (!strcmp(name, list[i])) return i;
+    return -1;
+}
+
+// {"vehicle":{"name":"kia-cerato-2021","bitrate":500000,"filter":false,"pre_s":60,
+//   "vin_pid":2,                           library request that returns the VIN; -1 = none
+//   "wake":"can",                          asleep, wake on CAN traffic (default) or "vcc": the supply rising
+//   "trip":["odo_km","fuel_l","run_s"],    up to 4 signals sent with the trip-start and trip-end events
+//   "ign":{"src":"acc"}                                        the ACC wire (default)
+//   "ign":{"src":"vcc","on_mv":13200,"off_mv":12800,"hold_s":10}
+//   "ign":{"src":"sig","key":"rpm","min":1,"hold_s":10}        no "min": any answer counts
+//   "ign":{"src":"frame","id":"541","at":0,"mask":"FF","eq":"03","hold_s":3}}}
+// Absent fields keep their value. False if there is no "vehicle" object or it is invalid.
+static inline bool gx5_parse_vehicle(const char *js, gx5_can_cfg_t *cfg)
+{
+    static const char *const srcs[] = {"acc", "vcc", "sig", "frame", NULL};
+    char name[sizeof cfg->name], src[8], hex[10];
+    const char *o = gx5_json_val(js, "vehicle"), *p;
+    gx5_ign_cfg_t *g = &cfg->ign;
+    uint8_t b;
+    if (!o || *o != '{' || !gx5_json_str(o, "name", name, sizeof name) || !gx5_json_str(o, "src", src, sizeof src)) return false;
+    if (name[0]) strcpy(cfg->name, name);
+    double rate = gx5_json_num(o, "bitrate", cfg->bitrate), pre = gx5_json_num(o, "pre_s", cfg->pre_s), hold = gx5_json_num(o, "hold_s", g->hold_s);
+    double on = gx5_json_num(o, "on_mv", g->on_mv), off = gx5_json_num(o, "off_mv", g->off_mv), at = gx5_json_num(o, "at", g->at);
+    if (rate < 10000 || rate > 1000000 || pre < 5 || pre > 3600 || hold < 1 || hold > 3600 || on < 0 || on > 40000 || off < 0 || off > on || at < 0 || at > 7) return false;
+    if (src[0]) {
+        int i = gx5_pick(src, srcs);
+        if (i < 0) return false;
+        g->src = (uint8_t)i;
+    }
+    if (gx5_json_val(o, "id")) {
+        char *end;
+        if (!gx5_json_str(o, "id", hex, sizeof hex) || !hex[0]) return false;
+        unsigned long id = strtoul(hex, &end, 16);
+        if (*end || id > 0x1FFFFFFF) return false;
+        g->id = (uint32_t)id;
+    }
+    if (gx5_json_val(o, "mask")) {
+        if (!gx5_json_str(o, "mask", hex, sizeof hex) || gx5_hex(hex, &b, 1) != 1) return false;
+        g->mask = b;
+    }
+    if (gx5_json_val(o, "eq")) {
+        if (!gx5_json_str(o, "eq", hex, sizeof hex) || gx5_hex(hex, &b, 1) != 1) return false;
+        g->eq = b;
+    }
+    if (gx5_json_val(o, "key") && (!gx5_json_str(o, "key", g->key, sizeof g->key) || !g->key[0])) return false;
+    if (g->src == GX5_IGN_VCC && (on < 1 || off < 1)) return false;
+    if (g->src == GX5_IGN_SIG && !g->key[0]) return false;
+    cfg->bitrate = (uint32_t)rate;
+    cfg->pre_s = (uint16_t)pre;
+    double vin = gx5_json_num(o, "vin_pid", cfg->vin_cmd);
+    cfg->vin_cmd = vin >= 0 && vin < GX5_CAN_CMDS ? (uint8_t)vin : 0xFF;
+    char wake[8];
+    if (!gx5_json_str(o, "wake", wake, sizeof wake) || (wake[0] && strcmp(wake, "can") && strcmp(wake, "vcc"))) return false;
+    if (wake[0]) cfg->wake_vcc = wake[0] == 'v';
+    if ((p = gx5_json_val(o, "trip"))) {
+        char trip[GX5_TRIP_KEYS][GX5_KEY_LEN] = {{0}};
+        if (*p++ != '[') return false;
+        for (int i = 0;; i++) {
+            while (*p == ' ' || *p == ',') p++;
+            if (*p == ']') break;
+            const char *e = *p == '"' ? strchr(p + 1, '"') : NULL;
+            if (!e || i >= GX5_TRIP_KEYS || e - p - 1 < 1 || e - p - 1 >= GX5_KEY_LEN) return false;
+            memcpy(trip[i], p + 1, e - p - 1);
+            p = e + 1;
+        }
+        memcpy(cfg->trip, trip, sizeof trip);
+    }
+    g->hold_s = (uint16_t)hold;
+    g->on_mv = (uint16_t)on;
+    g->off_mv = (uint16_t)off;
+    g->at = (uint8_t)at;
+    g->min = (float)gx5_json_num(o, "min", g->min);
     if ((p = gx5_json_val(o, "filter"))) cfg->filter = *p == 't' || *p == '1';
     return true;
 }
 
-// {"can_req":{"slot":0,"id":"7DF","data":"02010C","interval":10}}  (interval 0 clears the slot)
-// Returns the slot, or -1 if there is no valid "can_req" object.
-static inline int gx5_parse_can_req(const char *js, gx5_can_req_t *r)
+// {"pid":{"n":0,"id":"7E0","data":"02010C"}}   library request n; no "id" clears it.
+// Returns n, or -1 if there is no valid "pid" object.
+static inline int gx5_parse_pid(const char *js, gx5_can_cfg_t *cfg)
 {
     char id[10], data[17];
-    const char *o = gx5_json_val(js, "can_req"), *p;
-    memset(r, 0, sizeof *r);
-    if (!o || *o != '{' || !(p = gx5_json_val(o, "slot"))) return -1;
-    long slot = atol(p), interval = (p = gx5_json_val(o, "interval")) ? atol(p) : 0;
-    if (slot < 0 || slot >= GX5_CAN_REQS || *gx5_json_val(o, "slot") < '0' || interval < 0 || interval > 65535) return -1;
-    if (!interval) return (int)slot;
-    if (!gx5_json_str(o, "id", id, sizeof id) || !gx5_json_str(o, "data", data, sizeof data)) return -1;
-    char *end;
-    unsigned long can_id = strtoul(id, &end, 16);
-    int n = gx5_hex(data, r->frame.data, 8);
-    if (!id[0] || *end || can_id > 0x1FFFFFFF || n < 1) return -1;
-    r->frame.id = (uint32_t)can_id;
-    r->frame.ext = can_id > 0x7FF;
-    r->frame.dlc = (uint8_t)n;
-    r->interval_s = (uint16_t)interval;
-    return (int)slot;
+    gx5_frame_t f = {0};
+    const char *o = gx5_json_val(js, "pid");
+    if (!o || *o != '{') return -1;
+    double n = gx5_json_num(o, "n", -1);
+    if (n < 0 || n >= GX5_CAN_CMDS || !gx5_json_str(o, "id", id, sizeof id) || !gx5_json_str(o, "data", data, sizeof data)) return -1;
+    if (id[0]) {
+        char *end;
+        unsigned long can_id = strtoul(id, &end, 16);
+        int len = gx5_hex(data, f.data, 8);
+        if (*end || can_id > 0x1FFFFFFF || len < 1) return -1;
+        f.id = (uint32_t)can_id;
+        f.ext = can_id > 0x7FF;
+        // 11-bit requests go out 8 bytes long, zero padded, as OBD on CAN requires: a 2021
+        // Kia Cerato ignored 3-byte requests and answered the padded ones (2026-11-24).
+        f.dlc = f.ext ? (uint8_t)len : 8;
+    }
+    cfg->cmd[(int)n] = f;
+    return (int)n;
+}
+
+// {"sig":{"n":0,"key":"rpm","pid":0,"bix":0,"len":16,"mul":1,"div":4,"add":0,"sign":false,"blsb":false,"null":65535}}
+// "null": a decoded value that means "no value" (OBDb nullmin / nullmax), dropped.
+// Signal n, decoded from the answer to library request "pid"; no "key" clears it.
+// The field names are OBDb's. Returns n, or -1 if there is no valid "sig" object.
+static inline int gx5_parse_sig(const char *js, gx5_can_cfg_t *cfg)
+{
+    gx5_can_sig_t g = {0};
+    const char *o = gx5_json_val(js, "sig");
+    if (!o || *o != '{') return -1;
+    double n = gx5_json_num(o, "n", -1), div = gx5_json_num(o, "div", 1);
+    if (n < 0 || n >= GX5_CAN_SIGS || !gx5_json_str(o, "key", g.key, sizeof g.key)) return -1;
+    if (g.key[0]) {
+        double cmd = gx5_json_num(o, "pid", -1), bix = gx5_json_num(o, "bix", 0), len = gx5_json_num(o, "len", 8);
+        if (cmd < 0 || cmd >= GX5_CAN_CMDS || bix < 0 || len < 1 || len > 32 || bix + len > GX5_CAN_VAL_MAX * 8 || div == 0) return -1;
+        if (strspn(g.key, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_") != strlen(g.key)) return -1; // goes into JSON as is
+        g.cmd = (uint8_t)cmd;
+        g.bix = (uint16_t)bix;
+        g.len = (uint8_t)len;
+        g.flags = (gx5_json_flag(o, "sign", false) ? GX5_SIG_SIGNED : 0) | (gx5_json_flag(o, "blsb", false) ? GX5_SIG_LE : 0);
+        if ((g.flags & GX5_SIG_LE) && (g.bix % 8 || g.len % 8)) return -1;
+        g.mul = (float)(gx5_json_num(o, "mul", 1) / div);
+        g.add = (float)gx5_json_num(o, "add", 0);
+        if (gx5_json_val(o, "null")) g.flags |= GX5_SIG_NULL, g.nul = (float)gx5_json_num(o, "null", 0);
+    }
+    cfg->sig[(int)n] = g;
+    return (int)n;
+}
+
+// {"can":{"state":"pre|on|off","mode":"off|listen|obd2|j1939","poll":[[0,1],[3,0.5],[7,60]]}}
+// One state: its mode and its request list as [library request, seconds] pairs. An
+// absent "mode" or "poll" keeps its value; "poll":[] clears the list. Listen mode
+// never transmits, so its list is not sent. Returns the state, or -1.
+static inline int gx5_parse_can_state(const char *js, gx5_can_cfg_t *cfg)
+{
+    static const char *const states[] = {"pre", "on", "off", NULL}, *const modes[] = {"off", "listen", "obd2", "j1939", NULL};
+    char state[8], mode[8];
+    gx5_can_poll_t poll[GX5_CAN_POLL] = {0};
+    const char *o = gx5_json_val(js, "can"), *p;
+    if (!o || *o != '{' || !gx5_json_str(o, "state", state, sizeof state) || !gx5_json_str(o, "mode", mode, sizeof mode)) return -1;
+    int st = gx5_pick(state, states), m = mode[0] ? gx5_pick(mode, modes) : cfg->st[st < 0 ? 0 : st].mode;
+    if (st < 0 || m < 0) return -1;
+    if ((p = gx5_json_val(o, "poll"))) {
+        if (*p++ != '[') return -1;
+        for (int i = 0;; i++) {
+            char *end;
+            while (*p == ' ' || *p == ',') p++;
+            if (*p == ']') break;
+            if (*p++ != '[' || i >= GX5_CAN_POLL) return -1;
+            long cmd = strtol(p, &end, 10);
+            if (end == p || *end != ',') return -1;
+            double sec = strtod(p = end + 1, &end);
+            if (end == p || *end != ']' || cmd < 0 || cmd >= GX5_CAN_CMDS || sec < 0.1 || sec > 6553) return -1;
+            poll[i] = (gx5_can_poll_t){.cmd = (uint8_t)cmd, .ds = (uint16_t)(sec * 10 + 0.5)};
+            p = end + 1;
+        }
+        memcpy(cfg->st[st].poll, poll, sizeof poll);
+    }
+    cfg->st[st].mode = (uint8_t)m;
+    return st;
 }
