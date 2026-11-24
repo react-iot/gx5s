@@ -56,6 +56,15 @@ menu "GX5s application"
         config GX5_PROTECT_RECHECK_S
             int "Re-measure the supply every (s) while in PROTECT"
             default 1800
+        config GX5_VCC_WAKE_MV
+            int "Wake from sleep when the supply rises this much (mV, 0 = never)"
+            default 800
+            help
+                For vehicle profiles with "wake":"vcc" (no ignition wire, and an
+                OBD-II port that carries no traffic): the alternator lifting the supply is
+                the sign of an engine start. The ULP coprocessor samples the
+                supply four times a second and wakes the device when it stays this
+                far above the lowest level seen during the sleep.
     endmenu
 
     menu "Timing"

@@ -32,9 +32,12 @@ static bool s_applied; // s_state is what the bus is running (or stopped) for
 static volatile uint32_t s_frames;
 static int64_t s_last[GX5_CAN_POLL], s_busy_until; // ms
 static gx5_ign_t s_ign;
+static gx5_trip_t s_trip;
 static bool s_ign_told, s_ign_retell; // retell: the profile changed, report the state again
 static bool s_vin_want;               // ask for the VIN until it is answered
 static int64_t s_vin_last;
+
+static volatile uint32_t s_err_flags, s_errs; // kinds of bus error seen (twai_error_flags_t) and how many
 
 static int64_t now_ms(void) { return esp_timer_get_time() / 1000; }
 static int mode(void) { return s_cfg.st[s_state].mode; }
@@ -52,6 +55,36 @@ static bool can_rx(twai_node_handle_t node, const twai_rx_done_event_data_t *e, 
     s_frames = s_frames + 1;
     xQueueSendFromISR(s_rxq, &f, &woken); // full queue: frame dropped
     return woken == pdTRUE;
+}
+
+static bool can_err(twai_node_handle_t node, const twai_error_event_data_t *e, void *ctx)
+{
+    s_err_flags = s_err_flags | e->err_flags.val;
+    s_errs = s_errs + 1;
+    return false;
+}
+
+// Every 5 s: a node that went bus-off is brought back (it would stay silent until
+// the next state change), and debug mode gets the health of the bus. Errors with no
+// frames received point at the wiring or the bitrate; "ack" alone means nobody is
+// listening at this bitrate.
+static void bus_check(void)
+{
+    static int64_t last;
+    twai_node_status_t st;
+    twai_node_record_t rec;
+    twai_error_flags_t f = {.val = s_err_flags};
+    if (!s_node || now_ms() - last < 5000 || twai_node_get_info(s_node, &st, &rec) != ESP_OK) return;
+    last = now_ms();
+    s_err_flags = 0;
+    GX5_DBG(TAG, "bus %s: tx errors %u, rx errors %u, bus errors %lu, callbacks %lu%s%s%s%s%s, frames %lu",
+            (const char *[]){"ok", "warning", "error-passive", "bus-off"}[st.state], st.tx_error_count, st.rx_error_count, (unsigned long)rec.bus_err_num,
+            (unsigned long)s_errs, f.ack_err ? " ack" : "", f.bit_err ? " bit" : "", f.form_err ? " form" : "", f.stuff_err ? " stuff" : "",
+            f.arb_lost ? " arb-lost" : "", (unsigned long)s_frames);
+    if (st.state == TWAI_ERROR_BUS_OFF) {
+        ESP_LOGW(TAG, "bus-off, recovering");
+        twai_node_recover(s_node);
+    }
 }
 
 // The driver transmits asynchronously from the pointer it is given, so frames
@@ -131,16 +164,19 @@ static void can_task(void *arg)
             if (gx5_obd_feed(&s_st, &f, &reply, &done)) can_tx(&reply);
             if (done) {
                 GX5_DBG(TAG, "answer from %lX complete", (unsigned long)f.id);
+                gx5_trip_update(&s_cfg, &s_st, &s_trip);
                 s_busy_until = 0;
                 gx5_ign_answer(&s_cfg, &s_st, &s_ign, f.id, now_ms());
             }
         } else if (got && mode() == GX5_CAN_J1939) {
             if (gx5_j1939_feed(&s_st, &s_cfg, &f, &reply)) can_tx(&reply);
+            gx5_trip_update(&s_cfg, &s_st, &s_trip);
         }
         if (got && s_vin_want) {
             const gx5_can_val_t *v = gx5_cmd_val(&s_st, &s_cfg.cmd[s_cfg.vin_cmd]);
             if (v && gx5_vin_from(v->data, v->len, vin)) s_vin_want = false;
         }
+        bus_check();
         schedule();
         bool on = gx5_ign_on(&s_cfg.ign, &s_ign, now_ms()), tell = s_cfg.ign.src >= GX5_IGN_SIG && (on != s_ign_told || s_ign_retell);
         if (tell) s_ign_told = on, s_ign_retell = false;
@@ -170,7 +206,7 @@ static void start_locked(void)
         .tx_queue_depth = 8,
         .flags.enable_listen_only = mode() == GX5_CAN_LISTEN, // listen: never drive or acknowledge
     };
-    twai_event_callbacks_t cbs = {.on_rx_done = can_rx};
+    twai_event_callbacks_t cbs = {.on_rx_done = can_rx, .on_error = can_err};
 
     memset(s_st.sess, 0, sizeof s_st.sess);
     memset(s_last, 0, sizeof s_last);
@@ -202,16 +238,27 @@ void gx5_can_state(int state)
 {
     xSemaphoreTake(s_lock, portMAX_DELAY);
     if (state != s_state || !s_applied) {
-        stop_locked(); // listen <-> active needs a new node
+        // Same mode in both states: keep the node, or an answer in flight is lost (a
+        // Cerato's odometer answer was cut off by pre -> on and came 30 s late).
+        bool keep = s_applied && s_node && s_cfg.st[state].mode == mode();
+        if (!keep) stop_locked(); // listen <-> active needs a new node
         s_state = state;
         s_applied = true;
-        start_locked();
+        if (keep) memset(s_last, 0, sizeof s_last); // the new state's requests are all due
+        else start_locked();
         ESP_LOGI(TAG, "state %s, mode %d", (const char *[]){"pre", "on", "off"}[state], mode());
     }
     xSemaphoreGive(s_lock);
 }
 
 uint32_t gx5_can_frames(void) { return s_frames; }
+
+void gx5_can_trip(char *out, size_t size)
+{
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    gx5_trip_json(&s_cfg, &s_trip, out, size);
+    xSemaphoreGive(s_lock);
+}
 
 void gx5_can_vin_check(void)
 {
@@ -221,11 +268,12 @@ void gx5_can_vin_check(void)
     xSemaphoreGive(s_lock);
 }
 
-void gx5_can_profile(gx5_ign_cfg_t *ign, uint16_t *pre_s)
+void gx5_can_profile(gx5_ign_cfg_t *ign, uint16_t *pre_s, bool *wake_vcc)
 {
     xSemaphoreTake(s_lock, portMAX_DELAY);
     *ign = s_cfg.ign;
     *pre_s = s_cfg.pre_s;
+    *wake_vcc = s_cfg.wake_vcc;
     xSemaphoreGive(s_lock);
 }
 
@@ -251,6 +299,7 @@ bool gx5_can_command(const char *json)
     s_ign.seen_ms = 0;
     s_ign_retell = true;
     s_vin_want = false;
+    memset(&s_trip, 0, sizeof s_trip);
     if (nvs_open("gx5", NVS_READWRITE, &h) == ESP_OK) {
         if (nvs_set_blob(h, "veh", &s_cfg, sizeof s_cfg) != ESP_OK || nvs_commit(h) != ESP_OK) ESP_LOGE(TAG, "profile not saved");
         nvs_close(h);
@@ -304,13 +353,15 @@ void gx5_can_init(void)
 void gx5_can_init(void) {}
 void gx5_can_state(int state) {}
 void gx5_can_vin_check(void) {}
+void gx5_can_trip(char *out, size_t size) { out[0] = '\0'; }
 void gx5_can_stop(void) {}
 uint32_t gx5_can_frames(void) { return 0; }
 bool gx5_can_command(const char *json) { return false; }
 void gx5_can_publish(bool (*send)(const char *json)) {}
-void gx5_can_profile(gx5_ign_cfg_t *ign, uint16_t *pre_s)
+void gx5_can_profile(gx5_ign_cfg_t *ign, uint16_t *pre_s, bool *wake_vcc)
 {
     *ign = (gx5_ign_cfg_t){0}; // the ACC wire
     *pre_s = 60;
+    *wake_vcc = false;
 }
 #endif

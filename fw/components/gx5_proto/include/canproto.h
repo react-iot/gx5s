@@ -29,6 +29,7 @@ typedef struct {
 #define GX5_CAN_SIGS 48 // library: decoded numbers
 #define GX5_CAN_POLL 16 // requests per state
 #define GX5_KEY_LEN  12
+#define GX5_TRIP_KEYS 4 // signals reported with the trip start and end events
 
 enum { GX5_ST_PRE, GX5_ST_ON, GX5_ST_OFF, GX5_ST_N }; // awake before ignition, ignition on, awake after ignition off
 enum { GX5_IGN_ACC, GX5_IGN_VCC, GX5_IGN_SIG, GX5_IGN_FRAME }; // where "ignition on" comes from
@@ -43,11 +44,12 @@ typedef struct {
 // the top bit of the first byte; value = raw * mul + add.
 #define GX5_SIG_SIGNED 1
 #define GX5_SIG_LE     2 // whole bytes, least significant first (OBDb "blsb")
+#define GX5_SIG_NULL   4 // the value `nul` means "no value" and is dropped
 typedef struct {
     char key[GX5_KEY_LEN]; // published name; "" = empty
     uint8_t cmd, len, flags;
     uint16_t bix;
-    float mul, add;
+    float mul, add, nul;
 } gx5_can_sig_t;
 
 typedef struct {
@@ -66,6 +68,8 @@ typedef struct {
     uint8_t filter;  // J1939: keep only PGNs that are in the library
     uint16_t pre_s;  // woken by CAN traffic or motion: wait this long for ignition
     uint8_t vin_cmd; // library request that returns the VIN; >= GX5_CAN_CMDS = none
+    uint8_t wake_vcc; // asleep, wake on a rise of the supply instead of on CAN traffic (the chip cannot do both)
+    char trip[GX5_TRIP_KEYS][GX5_KEY_LEN]; // signals sent with the trip-start and trip-end events
     gx5_ign_cfg_t ign;
     gx5_frame_t cmd[GX5_CAN_CMDS]; // dlc 0 = empty
     gx5_can_sig_t sig[GX5_CAN_SIGS];
@@ -91,6 +95,13 @@ static inline void gx5_can_defaults(gx5_can_cfg_t *c, uint32_t bitrate)
 typedef struct {
     int64_t seen_ms; // when the on condition last held; 0 = never
 } gx5_ign_t;
+
+// Last good value of each trip signal: still there for the trip-end event when the
+// vehicle has stopped answering or answers "no value".
+typedef struct {
+    double v[GX5_TRIP_KEYS];
+    bool have[GX5_TRIP_KEYS];
+} gx5_trip_t;
 
 // Latest value. OBD-II: id = ECU CAN id, mode = service, pid. J1939: id = PGN, mode = source address.
 typedef struct {
@@ -414,6 +425,10 @@ static inline bool gx5_sig_value(const gx5_can_sig_t *g, const uint8_t *d, size_
     double v = raw;
     if ((g->flags & GX5_SIG_SIGNED) && (raw >> (g->len - 1) & 1)) v -= (double)(1ULL << g->len);
     *out = v * g->mul + g->add;
+    if (g->flags & GX5_SIG_NULL) {
+        double d = *out - g->nul;
+        if (d > -0.001 && d < 0.001) return false;
+    }
     return true;
 }
 
@@ -437,6 +452,33 @@ static inline const gx5_can_sig_t *gx5_sig_find(const gx5_can_cfg_t *cfg, const 
     for (int i = 0; i < GX5_CAN_SIGS; i++)
         if (cfg->sig[i].key[0] && !strcmp(cfg->sig[i].key, key)) return &cfg->sig[i];
     return NULL;
+}
+
+// Refresh the trip signals from the stored answers.
+static inline void gx5_trip_update(const gx5_can_cfg_t *cfg, gx5_can_state_t *s, gx5_trip_t *t)
+{
+    for (int i = 0; i < GX5_TRIP_KEYS; i++) {
+        double x;
+        const gx5_can_sig_t *g = cfg->trip[i][0] ? gx5_sig_find(cfg, cfg->trip[i]) : NULL;
+        const gx5_can_val_t *v = g && g->cmd < GX5_CAN_CMDS ? gx5_cmd_val(s, &cfg->cmd[g->cmd]) : NULL;
+        if (v && gx5_sig_value(g, v->data, v->len, &x)) t->v[i] = x, t->have[i] = true;
+    }
+}
+
+// ,"odo_km":78882,"fuel_l":10.5  (each with a leading comma) for the trip signals that have a value.
+static inline void gx5_trip_json(const gx5_can_cfg_t *cfg, const gx5_trip_t *t, char *out, size_t size)
+{
+    size_t n = 0;
+    out[0] = '\0';
+    for (int i = 0; i < GX5_TRIP_KEYS; i++) {
+        if (!cfg->trip[i][0] || !t->have[i]) continue;
+        int len = snprintf(out + n, size - n, ",\"%s\":%.6g", cfg->trip[i], t->v[i]);
+        if (len < 0 || (size_t)len >= size - n) { // does not fit: leave it out
+            out[n] = '\0';
+            return;
+        }
+        n += len;
+    }
 }
 
 // Build {"ts":N,"sig":{"rpm":1726,..}} from signals whose answer changed, starting at
@@ -516,6 +558,8 @@ static inline int gx5_pick(const char *name, const char *const *list)
 
 // {"vehicle":{"name":"kia-cerato-2021","bitrate":500000,"filter":false,"pre_s":60,
 //   "vin_pid":2,                           library request that returns the VIN; -1 = none
+//   "wake":"can",                          asleep, wake on CAN traffic (default) or "vcc": the supply rising
+//   "trip":["odo_km","fuel_l","run_s"],    up to 4 signals sent with the trip-start and trip-end events
 //   "ign":{"src":"acc"}                                        the ACC wire (default)
 //   "ign":{"src":"vcc","on_mv":13200,"off_mv":12800,"hold_s":10}
 //   "ign":{"src":"sig","key":"rpm","min":1,"hold_s":10}        no "min": any answer counts
@@ -560,6 +604,22 @@ static inline bool gx5_parse_vehicle(const char *js, gx5_can_cfg_t *cfg)
     cfg->pre_s = (uint16_t)pre;
     double vin = gx5_json_num(o, "vin_pid", cfg->vin_cmd);
     cfg->vin_cmd = vin >= 0 && vin < GX5_CAN_CMDS ? (uint8_t)vin : 0xFF;
+    char wake[8];
+    if (!gx5_json_str(o, "wake", wake, sizeof wake) || (wake[0] && strcmp(wake, "can") && strcmp(wake, "vcc"))) return false;
+    if (wake[0]) cfg->wake_vcc = wake[0] == 'v';
+    if ((p = gx5_json_val(o, "trip"))) {
+        char trip[GX5_TRIP_KEYS][GX5_KEY_LEN] = {{0}};
+        if (*p++ != '[') return false;
+        for (int i = 0;; i++) {
+            while (*p == ' ' || *p == ',') p++;
+            if (*p == ']') break;
+            const char *e = *p == '"' ? strchr(p + 1, '"') : NULL;
+            if (!e || i >= GX5_TRIP_KEYS || e - p - 1 < 1 || e - p - 1 >= GX5_KEY_LEN) return false;
+            memcpy(trip[i], p + 1, e - p - 1);
+            p = e + 1;
+        }
+        memcpy(cfg->trip, trip, sizeof trip);
+    }
     g->hold_s = (uint16_t)hold;
     g->on_mv = (uint16_t)on;
     g->off_mv = (uint16_t)off;
@@ -586,13 +646,16 @@ static inline int gx5_parse_pid(const char *js, gx5_can_cfg_t *cfg)
         if (*end || can_id > 0x1FFFFFFF || len < 1) return -1;
         f.id = (uint32_t)can_id;
         f.ext = can_id > 0x7FF;
-        f.dlc = (uint8_t)len;
+        // 11-bit requests go out 8 bytes long, zero padded, as OBD on CAN requires: a 2021
+        // Kia Cerato ignored 3-byte requests and answered the padded ones (2026-11-24).
+        f.dlc = f.ext ? (uint8_t)len : 8;
     }
     cfg->cmd[(int)n] = f;
     return (int)n;
 }
 
-// {"sig":{"n":0,"key":"rpm","pid":0,"bix":0,"len":16,"mul":1,"div":4,"add":0,"sign":false,"blsb":false}}
+// {"sig":{"n":0,"key":"rpm","pid":0,"bix":0,"len":16,"mul":1,"div":4,"add":0,"sign":false,"blsb":false,"null":65535}}
+// "null": a decoded value that means "no value" (OBDb nullmin / nullmax), dropped.
 // Signal n, decoded from the answer to library request "pid"; no "key" clears it.
 // The field names are OBDb's. Returns n, or -1 if there is no valid "sig" object.
 static inline int gx5_parse_sig(const char *js, gx5_can_cfg_t *cfg)
@@ -613,6 +676,7 @@ static inline int gx5_parse_sig(const char *js, gx5_can_cfg_t *cfg)
         if ((g.flags & GX5_SIG_LE) && (g.bix % 8 || g.len % 8)) return -1;
         g.mul = (float)(gx5_json_num(o, "mul", 1) / div);
         g.add = (float)gx5_json_num(o, "add", 0);
+        if (gx5_json_val(o, "null")) g.flags |= GX5_SIG_NULL, g.nul = (float)gx5_json_num(o, "null", 0);
     }
     cfg->sig[(int)n] = g;
     return (int)n;

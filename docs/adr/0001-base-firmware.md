@@ -246,7 +246,32 @@ Status: accepted (2026-11-15)
       `{"sig":{"rpm":1726}}`, answers without a signal as text
       (`7E8 01 0C 1AF8`, `FEEE 00 8C7D..`) inside a JSON array. Limits: 40 values,
       128 bytes each (longer responses truncated), 4 concurrent multi-frame messages.
-    - Not done yet: voltage-rise wake (GX5sV2 used the ULP coprocessor), reading the
+    - **Wake on a supply rise** (`"wake":"vcc"`, `main/ulp/vcc.S`), for OBD-II ports that
+      carry no traffic unless asked (a 2021 Kia Cerato: nothing in listen mode, and the
+      device slept through an engine start). The ULP coprocessor averages 8 ADC readings
+      of the VCC divider four times a second, follows the lowest value of the sleep and
+      wakes the chip after three readings `GX5_VCC_WAKE_MV` above it (first version;
+      see the follower below). On the ESP32 the
+      ULP wake and ext0 exclude each other ("Conflicting wake-up trigger: ext0"), so
+      this replaces the CAN wake for that profile, as it did in GX5sV2. First engine
+      start in the car: asleep at 726 counts, lowest 608 (cranking), woke at 699,
+      ignition on 0.25 s after boot. That fired on the recovery from the cranking
+      dip, so any load dip in a parked car could wake it, and the reading also climbs
+      about 40 mV per degC as the board cools. The base is therefore a slow follower:
+      down one count a second, up one count every 30 s, first reading of the sleep as
+      the start. Only a sustained rise wakes; in this car the alternator added 0.8 V
+      about 13 s after the start. Not yet re-tested in the car in this form.
+    - OBD requests (11-bit ids) are sent 8 bytes long, zero padded: the Cerato ignored
+      3-byte requests that the bench simulator accepted.
+    - **Ignition and trip events**: `ign-on` at once, `trip-start` 6 s later with the
+      profile's trip signals (odometer, fuel, run time), `ign-off` and `trip-end` with
+      their last good values and the trip length. Events wait in RAM (four) for the
+      broker, because a wake's first seconds are offline, and join the stored telemetry
+      if the device sleeps first. A signal's `null` value ("no value", OBDb's nullmax)
+      is dropped: the Cerato's fuel level reads 127.5 L with ignition off.
+    - A state change keeps the CAN node when the mode does not change; restarting it
+      cut off a multi-frame answer and delayed the first odometer by 30 s.
+    - Not done yet: reading the
       profile back, decoding broadcast frames, signals on gateway-addressed (0x6xx)
       requests, Tesla decoder, ALDL (GM serial), CANopen.
 11. **Component layout** (`fw/components/`). One component per piece of hardware or

@@ -77,6 +77,16 @@ reports `{"ev":"ota","version":"…","result":"ok"}` (or the reason it failed) o
 The clock comes from the RTC at boot and is corrected from network time whenever the cell
 is up and from GPS time on every fix; all times are UTC.
 
+## Supply calibration
+
+The supply reading depends on one transistor per board and can be a volt out until it
+is calibrated. `{"vcc_cal":{"mv":12340}}` tells the device what the supply really is at
+that moment (a meter at the plug, or the vehicle's own voltage reading);
+`{"vcc_cal":{"vbe_mv":563}}` sets the underlying value directly. Kept across reboots.
+Do it before relying on the low-supply protection (`GX5_VCC_CUTOFF_MV`, 11.0 V): an
+uncalibrated board in a 2021 Cerato read 11.1 V on a resting battery the car itself
+put at 12.0 V.
+
 ## Debug mode
 
 `{"debug":true}` (MQTT or USB; kept across reboots, `false` turns it off) adds `dbg`
@@ -105,6 +115,8 @@ one message each:
 
 - **`pid`** — the library: up to 32 requests the vehicle answers, as raw frames (an
   OBD-II / UDS single-frame request, or a J1939 PGN request). No `id` clears entry `n`.
+  Requests with an 11-bit id are sent 8 bytes long, zero padded; vehicles ignore
+  shorter ones.
 - **`sig`** — up to 48 named numbers decoded on the device from the answer to library
   entry `pid`. The fields are those of the [OBDb](https://github.com/OBDb) signal sets:
   `len` bits at bit `bix` of the data after the PID, times `mul`, over `div`, plus `add`;
@@ -127,16 +139,40 @@ ignition on it asks again, stores the answer and publishes
 `{"ev":"vin","vin":"..","was":"..","changed":true}` on `event`. It needs the `on`
 state to be in a mode that transmits.
 
+**Ignition and trip events** go out on `event`, queued until the broker is reachable:
+
+```json
+{"ts":1795509648,"ev":"ign-on"}
+{"ts":1795509653,"ev":"trip-start","dur_s":6,"odo_km":78882,"fuel_l":10.5,"run_s":593}
+{"ts":1795512000,"ev":"ign-off"}
+{"ts":1795512000,"ev":"trip-end","dur_s":2352,"odo_km":78901,"fuel_l":9.0,"run_s":2940}
+```
+
+`trip-start` follows `ign-on` by 6 s, once the vehicle has answered. The values are
+the signals named in `"trip":["odo_km","fuel_l","run_s"]` of `vehicle` (up to four),
+each at its last good reading; `"null":127.5` on a signal marks the reading that means
+"no value" (the Cerato's fuel level with ignition off) so it is dropped. `dur_s` is
+the time since ignition on.
+
 `{"profile":"clear"}` puts the whole profile back as shipped.
 
 Ready-made profiles are in `fw/profiles/`, one message per line, to send in order.
 `kia-cerato-2021.jsonl` (run time as ignition, speed, fuel, odometer, doors, locks,
 hazard switch, brake light, handbrake, VIN) is built from the
 [OBDb Kia Cerato](https://github.com/OBDb/Kia-Cerato) signal set and decodes OBDb's
-2021 test answers correctly, but has not been run in a car yet.
+2021 test answers correctly and was run in a 2021 Cerato on 2026-11-24: every
+request is answered and the odometer matched the dash. The file restores ignition
+detection in its first lines; while a profile is being loaded with ignition off the
+device may still go to sleep (30 s after connecting), so a loader should check each
+line is acknowledged with `can: profile` on the console and resend after a wake.
 
 With any source but the ACC wire the device also **wakes on CAN traffic** (as well as
-motion and the heartbeat) and waits `pre_s` for ignition. A bus that never goes quiet
+motion and the heartbeat) and waits `pre_s` for ignition. Many OBD-II ports are gated
+and carry no traffic until something asks; for those set `"wake":"vcc"` in `vehicle`:
+the device then wakes when the supply rises `GX5_VCC_WAKE_MV` (0.8 V) above the lowest
+level seen during the sleep, which is what an engine start does (the dip while
+cranking and the recovery after it are enough). The chip cannot watch CAN traffic and
+the supply in the same sleep, so it is one or the other. A bus that never goes quiet
 is not armed as a wake source, and after three CAN wakes in a row without ignition it
 is left alone until something else wakes the device. A `sig` rule only works if the
 `pre` state polls that request, which means transmitting before ignition is known.

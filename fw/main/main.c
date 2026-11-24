@@ -32,6 +32,9 @@
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "parse.h"
+#include "ulp.h"
+#include "ulp_adc.h"
+#include "ulp_main.h"
 
 #define SEC(s) ((uint64_t)(s) * 1000000ULL)
 #ifdef CONFIG_GX5_LIGHT_SLEEP
@@ -65,6 +68,7 @@ static bool s_ign, s_connected, s_linger;
 static RTC_DATA_ATTR bool s_vin_checked;  // false after a power loss: the device may be in another vehicle now
 static bool s_was_on;       // ignition has been on since this wake
 static gx5_ign_cfg_t s_igc; // the vehicle profile's ignition rule ...
+static bool s_wake_vcc;     // ... and whether a supply rise, not CAN traffic, wakes us
 static uint16_t s_pre_s;    // ... and how long to wait for ignition after a CAN or motion wake
 static int s_low_count;
 static bool s_chg; // charger enabled
@@ -73,7 +77,8 @@ static char s_pop[9]; // provisioning PIN, from the device id
 static const char *s_wake = "power-on";
 static adc_oneshot_unit_handle_t s_adc;
 static adc_cali_handle_t s_cal; // eFuse-calibrated counts -> mV; NULL = use raw counts (about 1 mV each)
-static esp_timer_handle_t s_t_debounce, s_t_sleep, s_t_telemetry, s_t_vcc;
+static esp_timer_handle_t s_t_debounce, s_t_sleep, s_t_telemetry, s_t_vcc, s_t_trip;
+static int64_t s_trip_t0; // esp_timer time of the last ignition on
 
 // ── Measurements ────────────────────────────────────────────────────────────
 
@@ -95,7 +100,11 @@ static int adc_mv(adc_channel_t ch)
     return mv;
 }
 
-static int vcc_mv(void) { return gx5_vcc_node_to_mv(adc_mv(ADC_CHANNEL_0), CONFIG_GX5_VCC_VBE_MV); }
+// The supply reading hangs on one transistor's Vbe, which differs from board to board:
+// 1 mV of it moves the result 21 mV. {"vcc_cal":{"mv":12340}} ("the supply is 12.34 V
+// right now") or {"vcc_cal":{"vbe_mv":563}} sets it; kept in NVS, GX5_VCC_VBE_MV until then.
+static int s_vbe = CONFIG_GX5_VCC_VBE_MV;
+static int vcc_mv(void) { return gx5_vcc_node_to_mv(adc_mv(ADC_CHANNEL_0), s_vbe); }
 // LiPo voltage, measured only with the charger off: charging lifts the reading by
 // ~0.4 V (soak 2026-11-17), so while it charges this is the last resting value.
 static int bat_mv(void)
@@ -113,6 +122,30 @@ static bool supply_low(int mv)
 }
 
 static void store_telemetry(void);
+
+// Ignition, trip and VIN events must survive the seconds the modem needs after a wake
+// (the first "ign-on" in the car was sent 1 s after boot, 5 s before the broker was
+// there). Up to four wait in RAM for the connection; what is still waiting when the
+// device goes to sleep joins the stored telemetry and arrives on that topic.
+static char s_evq[4][GX5_PUB_MAX];
+static int s_evn;
+
+static void send_event(const char *js)
+{
+    ESP_LOGI(TAG, "event %s", js);
+    if (!s_evn && gx5_mqtt_publish("event", js, false)) return;
+    if (s_evn == 4) memmove(s_evq[0], s_evq[1], 3 * GX5_PUB_MAX), s_evn = 3; // the oldest gives way
+    strlcpy(s_evq[s_evn++], js, GX5_PUB_MAX);
+}
+
+static void flush_events(void)
+{
+    int sent = 0;
+    while (sent < s_evn && gx5_mqtt_publish("event", s_evq[sent], false)) sent++;
+    memmove(s_evq[0], s_evq[sent], (s_evn - sent) * GX5_PUB_MAX);
+    s_evn -= sent;
+}
+
 
 // ── Sleep ───────────────────────────────────────────────────────────────────
 
@@ -174,6 +207,36 @@ static bool factory_reset_check(void)
     return true;
 }
 
+extern const uint8_t ulp_bin_start[] asm("_binary_ulp_main_bin_start");
+extern const uint8_t ulp_bin_end[] asm("_binary_ulp_main_bin_end");
+
+// Hand the supply to the ULP coprocessor for this sleep (ulp/vcc.S): it wakes us when
+// the supply rises `rise_mv` above a slow follower of its level. A falling supply, a
+// short dip and its recovery, and the drift with temperature do not. Takes the ADC away from
+// the main CPU, so it is the last measurement-related call before sleeping.
+static void vcc_watch(int rise_mv)
+{
+    int raw = adc_avg(ADC_CHANNEL_0), node_mv = adc_mv(ADC_CHANNEL_0);
+    // Counts per mV at the pin, from this very reading; 0.030982 = divider with Q4 on (parse.h).
+    int margin = node_mv > 0 ? (int)(rise_mv * 0.030982 * raw / node_mv + 0.5) : 0;
+    ulp_adc_cfg_t cfg = {.adc_n = ADC_UNIT_1, .channel = ADC_CHANNEL_0, .atten = ADC_ATTEN_DB_12, .width = ADC_BITWIDTH_DEFAULT, .ulp_mode = ADC_ULP_MODE_FSM};
+    if (margin < 8) { // under the ADC's noise: it would wake us for nothing
+        ESP_LOGW(TAG, "supply watch not armed: %d mV is only %d counts", rise_mv, margin);
+        return;
+    }
+    adc_oneshot_del_unit(s_adc);
+    if (ulp_load_binary(0, ulp_bin_start, (ulp_bin_end - ulp_bin_start) / sizeof(uint32_t)) != ESP_OK || ulp_adc_init(&cfg) != ESP_OK) {
+        ESP_LOGW(TAG, "supply watch not armed");
+        return;
+    }
+    ulp_first = 1; // the first reading asleep becomes the base
+    ulp_margin = margin;
+    ulp_hits = ulp_down = ulp_up = 0;
+    ulp_set_wakeup_period(0, 250000);
+    GX5_DBG(TAG, "supply watch: now %d counts (%d mV at the pin), wake at +%d counts (+%d mV)", raw, node_mv, margin, rise_mv);
+    if (ulp_run(&ulp_entry - RTC_SLOW_MEM) != ESP_OK || esp_sleep_enable_ulp_wakeup() != ESP_OK) ESP_LOGW(TAG, "supply watch not armed");
+}
+
 static void deep_sleep(bool protect)
 {
     reset_window_close();
@@ -183,6 +246,8 @@ static void deep_sleep(bool protect)
     // the MCU browns out, the buck's enable floats back on and the board reboots in a loop.
     bool off = protect || HIBERNATE; // modem powered down for this sleep
     if (!s_connected && !protect) store_telemetry(); // an offline heartbeat still leaves a record
+    flush_events();
+    for (int i = 0; i < s_evn; i++) gx5_store_push(s_evq[i]); // never got out: keep them with the stored telemetry
     gx5_mqtt_publish("status/connected", protect ? "protect" : off ? "hibernate" : "sleep", true);
     gx5_modem_stop(off);
     gx5_exp_set(GX5_EXP_GSM_SLP, true); // DTR high: the modem may now sleep; low again at boot (expander init)
@@ -222,10 +287,12 @@ static void deep_sleep(bool protect)
     // ext0 is one pin: the ACC wire, or CAN traffic (CAN-RX low = a dominant bit; the
     // transceiver passes the bus through in standby) when the profile takes ignition
     // from somewhere else. This chip's ext1 only does "any high", so CAN-RX cannot go there.
+    // ext0 and the ULP wake exclude each other ("Conflicting wake-up trigger: ext0"), so a
+    // profile that wakes on the supply rising ("wake":"vcc") gives up the CAN wake.
     s_can_armed = false;
     if (s_igc.src == GX5_IGN_ACC) {
         esp_sleep_enable_ext0_wakeup(GX5_PIN_ACC_INT, ignition() ? 1 : 0); // next ignition change
-    } else if (!protect) {
+    } else if (!protect && !s_wake_vcc) {
         // A bus that keeps talking, or one that woke us CAN_WAKES_MAX times for nothing,
         // is left alone for this sleep: motion and the heartbeat still wake us.
         bool busy = false;
@@ -244,10 +311,12 @@ static void deep_sleep(bool protect)
             else ESP_LOGW(TAG, "GPIO%d stuck high, not armed as wake source", pins[i]);
         }
         if (mask) esp_sleep_enable_ext1_wakeup_io(mask, ESP_EXT1_WAKEUP_ANY_HIGH);
-        GX5_DBG(TAG, "wake sources: ext0 %s, ext1 mask %llx, timer %d s", s_igc.src == GX5_IGN_ACC ? "ACC wire" : s_can_armed ? "CAN traffic" : "none",
+        GX5_DBG(TAG, "wake sources: ext0 %s, ext1 mask %llx, timer %d s", s_igc.src == GX5_IGN_ACC ? "ACC wire" : s_can_armed ? "CAN traffic" : s_wake_vcc ? "none (supply watch)" : "none",
                 (unsigned long long)mask, CONFIG_GX5_HEARTBEAT_S);
     }
     esp_sleep_enable_timer_wakeup(SEC(protect ? CONFIG_GX5_PROTECT_RECHECK_S : CONFIG_GX5_HEARTBEAT_S));
+    // No ignition wire: an engine start shows as the supply rising. Also out of PROTECT.
+    if (s_igc.src != GX5_IGN_ACC && s_wake_vcc && CONFIG_GX5_VCC_WAKE_MV > 0 && vcc_mv() >= CONFIG_GX5_VCC_ABSENT_MV) vcc_watch(CONFIG_GX5_VCC_WAKE_MV);
     esp_deep_sleep_start();
 }
 
@@ -273,7 +342,8 @@ static void arm_acc(void)
 // (Re)read the ignition rule. The ACC wire is only watched when it is the source.
 static void load_profile(void)
 {
-    gx5_can_profile(&s_igc, &s_pre_s);
+    gx5_can_profile(&s_igc, &s_pre_s, &s_wake_vcc);
+    if (s_ign && !s_vin_checked) gx5_can_vin_check(); // a profile change drops a pending VIN request
     if (s_igc.src == GX5_IGN_ACC) {
         arm_acc();
     } else {
@@ -356,9 +426,38 @@ static void maybe_linger(void)
     esp_timer_stop(s_t_sleep);
     // Woken by the vehicle (CAN traffic, motion) and ignition comes from the profile's
     // rule: give the driver time to start before going back to sleep.
-    bool wait = !s_was_on && s_igc.src != GX5_IGN_ACC && (!strcmp(s_wake, "can") || !strcmp(s_wake, "motion"));
+    bool wait = !s_was_on && s_igc.src != GX5_IGN_ACC && (!strcmp(s_wake, "can") || !strcmp(s_wake, "motion") || !strcmp(s_wake, "vcc"));
     GX5_DBG(TAG, "ignition off and connected: sleep in %d s", wait ? s_pre_s : CONFIG_GX5_LINGER_S);
     esp_timer_start_once(s_t_sleep, SEC(wait ? s_pre_s : CONFIG_GX5_LINGER_S));
+}
+
+// {"ev":"trip-start"|"trip-end","dur_s":seconds since ignition on, the profile's trip signals}
+static void trip_event(const char *ev)
+{
+    char js[GX5_PUB_MAX], vals[160];
+    time_t now = time(NULL);
+    gx5_can_trip(vals, sizeof vals);
+    snprintf(js, sizeof js, "{\"ts\":%lld,\"ev\":\"%s\",\"dur_s\":%lld%s}", now > 1700000000 ? (long long)now : 0LL, ev,
+             (esp_timer_get_time() - s_trip_t0) / 1000000, vals);
+    send_event(js);
+}
+
+// Ignition on: "ign-on" at once, "trip-start" a few seconds later when the vehicle has
+// answered (odometer, fuel, ...). Ignition off: "ign-off" and "trip-end" with the last
+// good values and the length of the trip.
+static void ign_event(bool on)
+{
+    char js[64];
+    time_t now = time(NULL);
+    snprintf(js, sizeof js, "{\"ts\":%lld,\"ev\":\"%s\"}", now > 1700000000 ? (long long)now : 0LL, on ? "ign-on" : "ign-off");
+    send_event(js);
+    esp_timer_stop(s_t_trip);
+    if (on) {
+        s_trip_t0 = esp_timer_get_time();
+        esp_timer_start_once(s_t_trip, SEC(6));
+    } else {
+        trip_event("trip-end");
+    }
 }
 
 static void set_ignition(bool on)
@@ -368,6 +467,7 @@ static void set_ignition(bool on)
     if (on) s_can_wakes = 0;
     ESP_LOGI(TAG, "ignition %s", on ? "on" : "off");
     apply_ignition();
+    ign_event(on);
     publish_telemetry();
     maybe_linger();
 }
@@ -383,6 +483,9 @@ static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         if (s_igc.src != GX5_IGN_ACC) break;
         set_ignition(ignition());
         arm_acc();
+        break;
+    case GX5_EV_TRIP_START:
+        if (s_ign) trip_event("trip-start");
         break;
     case GX5_EV_CAN_IGN:
         if (s_igc.src >= GX5_IGN_SIG) set_ignition(*(bool *)data);
@@ -400,16 +503,16 @@ static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         }
         s_vin_checked = true;
         ESP_LOGI(TAG, "VIN %s%s%s", vin, strcmp(was, vin) ? ", was " : " (unchanged)", strcmp(was, vin) ? (was[0] ? was : "not known") : "");
-        // ponytail: published once; if the broker is unreachable right now the event is lost (the VIN is still stored)
         snprintf(js, sizeof js, "{\"ts\":%lld,\"ev\":\"vin\",\"vin\":\"%s\",\"was\":\"%s\",\"changed\":%s}", now > 1700000000 ? (long long)now : 0LL, vin, was,
                  strcmp(was, vin) ? "true" : "false");
-        gx5_mqtt_publish("event", js, false);
+        send_event(js);
         break;
     }
     case GX5_EV_MQTT_CONNECTED:
         s_connected = true;
         gx5_exp_set(GX5_EXP_LED_SVR, true);
         gx5_mqtt_publish("status/connected", gx5_mqtt_provisioning() ? "provisioning" : "online", true);
+        flush_events();
         publish_telemetry();
         maybe_linger();
         break;
@@ -422,6 +525,7 @@ static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         gx5_broker_t b;
         char ext[GX5_EXT_LINE];
         bool is_prov;
+        const char *cal;
         char loc0[GX5_LOC_LEN];
         if (!strncmp(m->topic, "discovery/", 10)) { // unprovisioned: only a login matters (our own announcement echoes here too)
             if (gx5_parse_login(m->data, &b, loc0)) {
@@ -465,6 +569,24 @@ static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
             } else {
                 ESP_LOGI(TAG, "ota requested: %s", ver[0] ? ver : "latest");
                 gx5_ota_start(ver[0] ? ver : "latest");
+            }
+        } else if ((cal = gx5_json_val(m->data, "vcc_cal")) && *cal == '{') {
+            // "mv": what the supply really is at this moment (a meter at the plug, or the
+            // vehicle's own reading); "vbe_mv": the calibration value itself.
+            int node = adc_mv(ADC_CHANNEL_0), was = vcc_mv();
+            double actual = gx5_json_num(cal, "mv", 0), vbe = gx5_json_num(cal, "vbe_mv", 0);
+            if (actual > 0) vbe = (node * 10000.0 - (actual - 300) * 309.82) / 6592; // gx5_vcc_node_to_mv() solved for Vbe
+            if (vbe < 400 || vbe > 800) {
+                ESP_LOGW(TAG, "supply calibration refused: Vbe %d mV is not plausible", (int)vbe);
+            } else {
+                nvs_handle_t h;
+                s_vbe = (int)(vbe + 0.5);
+                if (nvs_open("gx5", NVS_READWRITE, &h) == ESP_OK) {
+                    nvs_set_i32(h, "vbe", s_vbe);
+                    nvs_commit(h);
+                    nvs_close(h);
+                }
+                ESP_LOGI(TAG, "supply calibration: Vbe %d mV, reading %d -> %d mV", s_vbe, was, vcc_mv());
             }
         } else if (gx5_json_val(m->data, "debug")) { // {"debug":true}
             nvs_handle_t h;
@@ -613,6 +735,7 @@ void app_main(void)
     esp_pm_config_t pm = {.max_freq_mhz = 80, .min_freq_mhz = 80, .light_sleep_enable = LIGHT_SLEEP};
     ESP_ERROR_CHECK(esp_pm_configure(&pm));
 
+    ulp_timer_stop(); // the supply watch of the last sleep: the ADC is ours again
     adc_oneshot_unit_init_cfg_t unit = {.unit_id = ADC_UNIT_1};
     adc_oneshot_chan_cfg_t chan = {.atten = ADC_ATTEN_DB_12, .bitwidth = ADC_BITWIDTH_DEFAULT};
     ESP_ERROR_CHECK(adc_oneshot_new_unit(&unit, &s_adc));
@@ -625,6 +748,7 @@ void app_main(void)
     rtc_gpio_deinit(GX5_PIN_CAN_RX); // ext0 leaves its pin with the RTC: back to the CAN controller
     if (causes & BIT(ESP_SLEEP_WAKEUP_EXT0)) s_wake = s_can_armed ? "can" : "ignition";
     else if (causes & BIT(ESP_SLEEP_WAKEUP_EXT1)) s_wake = esp_sleep_get_ext1_wakeup_status() & (1ULL << GX5_PIN_APS_INT) ? "motion" : "modem";
+    else if (causes & BIT(ESP_SLEEP_WAKEUP_ULP)) s_wake = "vcc"; // the supply rose (ulp/vcc.S)
     else if (causes & BIT(ESP_SLEEP_WAKEUP_TIMER)) s_wake = "timer";
 
     uint8_t mac[6];
@@ -642,26 +766,30 @@ void app_main(void)
     printf("## %-54s ##\n", CONFIG_GX5_REPO);
     printf("############################################################\n");
 
-    vTaskDelay(pdMS_TO_TICKS(300)); // regulator + ACC/VCC dividers settle
-    s_ign = ignition();
-    int mv = vcc_mv();
-    ESP_LOGI(TAG, "id=%s wake=%s ign=%d vcc=%d mV bat=%d mV rst=%d", s_id, s_wake, s_ign, mv, bat_mv(), esp_reset_reason());
-
-    esp_err_t err = nvs_flash_init(); // broker and CAN configuration live here
+    esp_err_t err = nvs_flash_init(); // broker, vehicle profile and calibration live here
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         nvs_flash_erase();
         err = nvs_flash_init();
     }
     if (err != ESP_OK) ESP_LOGE(TAG, "NVS unavailable: configuration will not persist");
-    bool wiped = err == ESP_OK && factory_reset_check();
     nvs_handle_t nvs;
-    if (nvs_open("gx5", NVS_READONLY, &nvs) == ESP_OK) {
+    if (nvs_open("gx5", NVS_READONLY, &nvs) == ESP_OK) { // before the first supply reading: it decides PROTECT
         uint8_t dbg = 0;
+        int32_t vbe = 0;
         nvs_get_u8(nvs, "dbg", &dbg);
         gx5_debug = dbg;
+        if (nvs_get_i32(nvs, "vbe", &vbe) == ESP_OK && vbe >= 400 && vbe <= 800) s_vbe = vbe;
         nvs_close(nvs);
     }
-    GX5_DBG(TAG, "debug mode on: wake causes %lx, ext1 status %llx", (unsigned long)causes, (unsigned long long)esp_sleep_get_ext1_wakeup_status());
+
+    vTaskDelay(pdMS_TO_TICKS(300)); // regulator + ACC/VCC dividers settle
+    s_ign = ignition();
+    int mv = vcc_mv();
+    ESP_LOGI(TAG, "id=%s wake=%s ign=%d vcc=%d mV bat=%d mV rst=%d", s_id, s_wake, s_ign, mv, bat_mv(), esp_reset_reason());
+    bool wiped = err == ESP_OK && factory_reset_check();
+    GX5_DBG(TAG, "debug mode on: wake causes %lx, ext1 status %llx; supply watch last %lu base %lu margin %lu", (unsigned long)causes,
+            (unsigned long long)esp_sleep_get_ext1_wakeup_status(), (unsigned long)(ulp_last & 0xFFFF), (unsigned long)(ulp_base & 0xFFFF),
+            (unsigned long)(ulp_margin & 0xFFFF));
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     ESP_ERROR_CHECK(esp_event_handler_register(GX5_EVENT, ESP_EVENT_ANY_ID, on_event, NULL));
     ESP_ERROR_CHECK(gpio_install_isr_service(0));
@@ -678,7 +806,7 @@ void app_main(void)
     gx5_ext_init();
     gx5_modem_start(s_id);
     gx5_can_init();
-    gx5_can_profile(&s_igc, &s_pre_s);
+    gx5_can_profile(&s_igc, &s_pre_s, &s_wake_vcc);
     if (s_igc.src != GX5_IGN_ACC) s_ign = false; // no ACC wire in this install: the profile's rule will tell
     if (!strcmp(s_wake, "can")) s_can_wakes++;
     else if (strcmp(s_wake, "timer")) s_can_wakes = 0; // anything else from the vehicle: CAN wake gets a fresh chance
@@ -692,10 +820,12 @@ void app_main(void)
     s_t_sleep = make_timer(GX5_EV_SLEEP_DUE);
     s_t_telemetry = make_timer(GX5_EV_TELEMETRY);
     s_t_vcc = make_timer(GX5_EV_VCC_TICK);
+    s_t_trip = make_timer(GX5_EV_TRIP_START);
     esp_timer_start_periodic(s_t_vcc, SEC(5));
     ESP_ERROR_CHECK(esp_sleep_enable_gpio_wakeup());
     ESP_ERROR_CHECK(gpio_isr_handler_add(GX5_PIN_ACC_INT, acc_isr, NULL));
     apply_ignition();
+    if (s_ign) ign_event(true); // woken by the ignition wire: the trip starts here
     load_profile();
     xTaskCreate(usb_task, "usb", 3072, NULL, 4, NULL);
 }

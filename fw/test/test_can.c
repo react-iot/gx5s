@@ -165,9 +165,9 @@ int main(void)
 
     // Library requests.
     assert(gx5_parse_pid("{\"pid\":{\"n\":0,\"id\":\"7E0\",\"data\":\"02010C\"}}", &c) == 0);
-    assert(c.cmd[0].id == 0x7E0 && !c.cmd[0].ext && c.cmd[0].dlc == 3 && c.cmd[0].data[2] == 0x0C);
+    assert(c.cmd[0].id == 0x7E0 && !c.cmd[0].ext && c.cmd[0].dlc == 8 && c.cmd[0].data[2] == 0x0C && !c.cmd[0].data[3]); // padded to 8
     assert(gx5_parse_pid("{\"pid\":{\"n\":1,\"id\":\"7C6\",\"data\":\"0322B002\"}}", &c) == 1);
-    assert(gx5_parse_pid("{\"pid\":{\"n\":2,\"id\":\"18EA00F8\",\"data\":\"EEFE00\"}}", &c) == 2 && c.cmd[2].ext);
+    assert(gx5_parse_pid("{\"pid\":{\"n\":2,\"id\":\"18EA00F8\",\"data\":\"EEFE00\"}}", &c) == 2 && c.cmd[2].ext && c.cmd[2].dlc == 3); // J1939: as given
     assert(gx5_parse_pid("{\"pid\":{\"n\":2}}", &c) == 2 && !c.cmd[2].dlc); // clear
     assert(gx5_parse_pid("{\"pid\":{\"n\":32,\"id\":\"7DF\",\"data\":\"0201\"}}", &c) == -1);
     assert(gx5_parse_pid("{\"pid\":{\"n\":1,\"id\":\"7DG\",\"data\":\"0201\"}}", &c) == -1);
@@ -300,6 +300,38 @@ int main(void)
     assert(!gx5_vin_from((const uint8_t *)"1GX5SBENCH", 10, vin) && !gx5_vin_from((const uint8_t *)"1GX5SBENCH\xFFTEST001", 17, vin));
     assert(gx5_parse_vehicle("{\"vehicle\":{\"vin_pid\":2}}", &c) && c.vin_cmd == 2);
     assert(gx5_parse_vehicle("{\"vehicle\":{\"vin_pid\":-1}}", &c) && c.vin_cmd == 0xFF);
+    assert(!c.wake_vcc && gx5_parse_vehicle("{\"vehicle\":{\"wake\":\"vcc\"}}", &c) && c.wake_vcc);
+    assert(gx5_parse_vehicle("{\"vehicle\":{\"name\":\"x\"}}", &c) && c.wake_vcc); // kept
+    assert(!gx5_parse_vehicle("{\"vehicle\":{\"wake\":\"gps\"}}", &c));
+    assert(gx5_parse_vehicle("{\"vehicle\":{\"wake\":\"can\"}}", &c) && !c.wake_vcc);
+
+    // Trip signals: last good values, "no value" readings dropped.
+    static gx5_can_cfg_t tc;
+    static gx5_trip_t trip;
+    char tj[160];
+    gx5_can_defaults(&tc, 500000);
+    assert(gx5_parse_pid("{\"pid\":{\"n\":2,\"id\":\"7C6\",\"data\":\"0322B002\"}}", &tc) == 2);
+    assert(gx5_parse_sig("{\"sig\":{\"n\":0,\"key\":\"fuel_l\",\"pid\":2,\"bix\":32,\"len\":8,\"div\":2,\"null\":127.5}}", &tc) == 0);
+    assert(gx5_parse_sig("{\"sig\":{\"n\":1,\"key\":\"odo_km\",\"pid\":2,\"bix\":48,\"len\":24}}", &tc) == 1);
+    assert(gx5_parse_vehicle("{\"vehicle\":{\"trip\":[\"odo_km\", \"fuel_l\",\"run_s\"]}}", &tc) && !strcmp(tc.trip[1], "fuel_l") && !tc.trip[3][0]);
+    assert(!gx5_parse_vehicle("{\"vehicle\":{\"trip\":[\"a\",\"b\",\"c\",\"d\",\"e\"]}}", &tc) && !strcmp(tc.trip[0], "odo_km"));
+    assert(!gx5_parse_vehicle("{\"vehicle\":{\"trip\":[\"a_name_too_long\"]}}", &tc));
+    memset(&st, 0, sizeof st);
+    gx5_trip_json(&tc, &trip, tj, sizeof tj);
+    assert(!tj[0]); // nothing read yet
+    uint8_t b002[] = {0xD0, 0, 0, 0, 0x15, 0xA7, 0x01, 0x34, 0x22, 0, 0, 0}; // fuel 10.5 L, odo 78882 km
+    gx5_can_store(&st, 0x7CE, 0x22, 0xB002, b002, sizeof b002);
+    gx5_trip_update(&tc, &st, &trip);
+    gx5_trip_json(&tc, &trip, tj, sizeof tj);
+    assert(!strcmp(tj, ",\"odo_km\":78882,\"fuel_l\":10.5"));
+    b002[4] = 0xFF; // ignition off: the cluster says "no fuel value" (127.5)
+    b002[8] = 0x23;
+    gx5_can_store(&st, 0x7CE, 0x22, 0xB002, b002, sizeof b002);
+    gx5_trip_update(&tc, &st, &trip);
+    gx5_trip_json(&tc, &trip, tj, sizeof tj);
+    assert(!strcmp(tj, ",\"odo_km\":78883,\"fuel_l\":10.5")); // fuel keeps its last good value
+    gx5_trip_json(&tc, &trip, tj, 20);
+    assert(!strcmp(tj, ",\"odo_km\":78883"));                    // what does not fit is left out whole
 
     puts("ok");
     return 0;

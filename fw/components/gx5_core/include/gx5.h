@@ -53,6 +53,7 @@ enum {
     GX5_EV_EXT_RX,            // line from the external UART, data: char[]
     GX5_EV_CAN_IGN,           // ignition as the vehicle profile's CAN rule sees it, data: bool
     GX5_EV_VIN,               // the vehicle answered the VIN request, data: char[18]
+    GX5_EV_TRIP_START,        // a few seconds into ignition on: the trip signals have been read
 };
 
 typedef struct {

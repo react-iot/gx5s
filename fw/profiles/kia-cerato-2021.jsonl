@@ -1,5 +1,8 @@
 {"profile":"clear"}
 {"pid":{"n":0,"id":"7E0","data":"02011F"}}
+{"sig":{"n":0,"key":"run_s","pid":0,"bix":0,"len":16}}
+{"can":{"state":"pre","mode":"obd2","poll":[[0,2]]}}
+{"vehicle":{"name":"kia-cerato-2021","bitrate":500000,"vin_pid":7,"wake":"vcc","pre_s":120,"trip":["odo_km","fuel_l","run_s"],"ign":{"src":"sig","key":"run_s","min":1,"hold_s":10}}}
 {"pid":{"n":1,"id":"7E0","data":"02010D"}}
 {"pid":{"n":2,"id":"7C6","data":"0322B002"}}
 {"pid":{"n":3,"id":"770","data":"0322BC03"}}
@@ -7,9 +10,9 @@
 {"pid":{"n":5,"id":"770","data":"0322BC05"}}
 {"pid":{"n":6,"id":"770","data":"0322BC06"}}
 {"pid":{"n":7,"id":"7DF","data":"020902"}}
-{"sig":{"n":0,"key":"run_s","pid":0,"bix":0,"len":16}}
+{"pid":{"n":8,"id":"7E0","data":"020142"}}
 {"sig":{"n":1,"key":"kmh","pid":1,"bix":0,"len":8}}
-{"sig":{"n":2,"key":"fuel_l","pid":2,"bix":32,"len":8,"div":2}}
+{"sig":{"n":2,"key":"fuel_l","pid":2,"bix":32,"len":8,"div":2,"null":127.5}}
 {"sig":{"n":3,"key":"odo_km","pid":2,"bix":48,"len":24}}
 {"sig":{"n":4,"key":"trunk","pid":3,"bix":32,"len":1}}
 {"sig":{"n":5,"key":"door_fl","pid":3,"bix":34,"len":1}}
@@ -23,7 +26,7 @@
 {"sig":{"n":13,"key":"hazard","pid":5,"bix":32,"len":8}}
 {"sig":{"n":14,"key":"brake","pid":6,"bix":32,"len":8}}
 {"sig":{"n":15,"key":"odo_mi","pid":2,"bix":72,"len":24}}
-{"can":{"state":"pre","mode":"obd2","poll":[[0,2]]}}
-{"can":{"state":"on","mode":"obd2","poll":[[0,5],[1,1],[2,30],[3,2],[4,5],[5,2],[6,1]]}}
+{"sig":{"n":16,"key":"bat_v","pid":2,"bix":40,"len":8,"div":12.8}}
+{"sig":{"n":17,"key":"ecu_v","pid":8,"bix":0,"len":16,"div":1000}}
+{"can":{"state":"on","mode":"obd2","poll":[[0,5],[1,1],[2,30],[3,2],[4,5],[5,2],[6,1],[8,30]]}}
 {"can":{"state":"off","mode":"obd2","poll":[[0,2],[2,10],[3,2],[4,2]]}}
-{"vehicle":{"name":"kia-cerato-2021","bitrate":500000,"vin_pid":7,"pre_s":120,"ign":{"src":"sig","key":"run_s","min":1,"hold_s":10}}}
