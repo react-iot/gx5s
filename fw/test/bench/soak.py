@@ -9,6 +9,7 @@ Writes to ~/gx5s-soak (GX5_SOAK_DIR):
                   LiPo V, LiPo mA (blank without the battery sensor)
     events.csv    boot (wake cause, reset reason, vcc, bat), sleep, fault, ign-on/ign-off
     console.log   every console line, timestamped
+    bat.csv       every battery-sensor reading (about 14 a second, no gaps): epoch, LiPo V, LiPo mA
 
 The hat keeps VCC on. Ignition is off except for GX5_SOAK_IGN_MIN minutes (10) every
 GX5_SOAK_IGN_EVERY_H hours (6; 0 = never), so both the hourly timer wake and a drive
@@ -19,6 +20,14 @@ lead (VIN+ to the cell, VIN- to the board), so discharge reads positive and char
 negative. GX5_BAT_INA is its address (0x41: A0 bridged; the hat's own sensor is 0x40),
 GX5_BAT_SHUNT_OHM its shunt (0.1; read the value off the breakout) and GX5_BAT_MAH the
 cell capacity for the run-time estimate (1000). Without the sensor those columns stay empty.
+The sensor averages the current over 68 ms and starts the next reading at once, so bat.csv
+misses nothing; the LiPo columns of samples.csv are the mean of each second.
+    python3 soak.py zero                # LiPo lead open at the board: logs the sensor's zero error
+
+Battery run-down (docs/battery-baseline-test-plan.md): GX5_SOAK_VCC=0 keeps the harness
+off so the board runs from its LiPo. GX5_BAT_END_V (e.g. 3.30) ends the run when the cell
+has been at or below it for 10 s: harness and ignition go on, and stay on, to recharge.
+Ignition always on: GX5_SOAK_IGN_EVERY_H=1 GX5_SOAK_IGN_MIN=60.
 
 Limits: with USB attached (needed for the console) a board with D9 fitted is also fed
 from USB, so the harness current is only the harness share. An I2C error on the Pi's bus
@@ -37,6 +46,8 @@ IGN_EVERY_S = float(os.environ.get("GX5_SOAK_IGN_EVERY_H", "6")) * 3600
 IGN_S = float(os.environ.get("GX5_SOAK_IGN_MIN", "10")) * 60
 BAT_INA = int(os.environ.get("GX5_BAT_INA", "0x41"), 0)
 BAT_SHUNT_OHM = float(os.environ.get("GX5_BAT_SHUNT_OHM", "0.1"))
+VCC_ON = os.environ.get("GX5_SOAK_VCC", "1") != "0"
+BAT_END_V = float(os.environ.get("GX5_BAT_END_V", "0"))  # 0 = never
 BAT_MAH = float(os.environ.get("GX5_BAT_MAH", "1000"))
 BOOT = re.compile(r"gx5: id=[\w:]+ wake=([\w-]+) ign=(\d) vcc=(\d+) mV bat=(\d+) mV rst=(\d+)")
 SLEEP = re.compile(r"gx5: (SLEEP|PROTECT|HIBERNATE): vcc=(\d+) mV bat=(\d+) mV")
@@ -65,11 +76,53 @@ def ina_word(bus, addr, reg):
     return ((v & 0xFF) << 8) | (v >> 8)  # INA219 is big-endian
 
 
+def bat_setup(bus):
+    # 0x39FF: shunt averaged over 128 samples (68 ms), bus voltage one 0.5 ms sample, so
+    # the current is measured 99 % of the time. Big-endian on the wire.
+    bus.write_word_data(BAT_INA, 0, 0xFF39)
+
+
 def bat_read(bus):
-    """LiPo volts and mA (+ = discharging) from the battery INA219."""
+    """A new reading as (LiPo volts, mA, + = discharging), or None if none is ready yet."""
+    v = ina_word(bus, BAT_INA, 2)
+    if not v & 2:  # conversion-ready flag
+        return None
     raw = ina_word(bus, BAT_INA, 1)  # shunt voltage, 10 uV per bit, signed
+    ina_word(bus, BAT_INA, 3)  # reading the power register clears the flag
     raw = raw - 0x10000 if raw & 0x8000 else raw
-    return (ina_word(bus, BAT_INA, 2) >> 3) * 0.004, raw * 1e-5 / BAT_SHUNT_OHM * 1000
+    return (v >> 3) * 0.004, raw * 1e-5 / BAT_SHUNT_OHM * 1000
+
+
+def battery(bus, acc, lock):
+    """Every sensor reading to bat.csv; `acc` [sum V, sum mA, count] feeds the 1 s rows."""
+    out = open_csv("bat.csv", ["epoch", "bat_v", "bat_ma"])
+    while True:
+        try:
+            if r := bat_read(bus):
+                out.writerow([f"{time.time():.3f}", f"{r[0]:.3f}", f"{r[1]:.2f}"])
+                with lock:
+                    acc[0] += r[0]
+                    acc[1] += r[1]
+                    acc[2] += 1
+        except OSError:  # the main loop counts and reports bus errors
+            pass
+        time.sleep(0.01)
+
+
+def zero():
+    from smbus2 import SMBus
+
+    bus, got = SMBus(1), []
+    bat_setup(bus)
+    end = time.time() + 10
+    while time.time() < end:
+        if r := bat_read(bus):
+            got.append(r[1])
+        time.sleep(0.01)
+    ma = sum(got) / len(got)
+    print(f"battery sensor zero: {ma:+.3f} mA over {len(got)} readings (subtract this from bat_ma)")
+    os.makedirs(DIR, exist_ok=True)
+    open_csv("events.csv", EVENT_COLS).writerow([now(), int(time.time()), "bat-zero", "", "", "", "", "", f"{ma:+.3f} mA"])
 
 
 def console(events):
@@ -115,20 +168,25 @@ def run():
     rig = lambda what: events.writerow([now(), int(time.time()), what, "", "", "", "", "", ""])
     hat = Hat()
     hat.acc(False)
-    hat.vcc(True)
-    rig("soak-start")
-    try:  # 128-sample averaging (68 ms per reading): sleep current is a fraction of a mA
-        hat.bus.write_word_data(BAT_INA, 0, 0xFF3F)  # config 0x3FFF, big-endian on the wire
+    hat.vcc(VCC_ON)
+    rig("soak-start" if VCC_ON else f"soak-start, harness off, ends at {BAT_END_V} V")
+    try:
+        bat_setup(hat.bus)
         bat = True
     except OSError:
         bat = False
     rig(f"battery sensor at {BAT_INA:#x}, shunt {BAT_SHUNT_OHM} ohm" if bat else f"no battery sensor at {BAT_INA:#x}")
     threading.Thread(target=console, args=(events,), daemon=True).start()
+    acc, lock = [0.0, 0.0, 0], threading.Lock()
+    if bat:
+        # Own bus handle: on a shared one the two threads swap sensor addresses mid-read
+        # (765 of 586142 rows had the harness voltage in bat_v, 2026-11-23).
+        threading.Thread(target=battery, args=(type(hat.bus)(1), acc, lock), daemon=True).start()
 
-    start, ign, errors = time.time(), False, 0
+    start, ign, errors, low, ended = time.time(), False, 0, 0, False
     while True:
         t = time.time()
-        want = IGN_EVERY_S > 0 and (t - start) % IGN_EVERY_S >= IGN_EVERY_S - IGN_S  # last minutes of each period
+        want = ended or IGN_EVERY_S > 0 and (t - start) % IGN_EVERY_S >= IGN_EVERY_S - IGN_S  # last minutes of each period
         if want != ign:
             ign = want
             hat.acc(ign)
@@ -136,8 +194,15 @@ def run():
         try:
             row = [now(), f"{t:.1f}", f"{hat.volts():.2f}", f"{hat.milliamps(10):.2f}", awake, int(ign)]
             if bat:
-                v, ma = bat_read(hat.bus)
-                row += [f"{v:.3f}", f"{ma:.2f}"]
+                with lock:
+                    v, ma, n = acc
+                    acc[:] = [0.0, 0.0, 0]
+                row += [f"{v / n:.3f}", f"{ma / n:.2f}"] if n else ["", ""]
+                low = low + 1 if n and BAT_END_V and v / n <= BAT_END_V else 0
+                if low >= 10 and not ended:  # run-down finished: recharge, never leave the cell flat
+                    ended = True
+                    hat.vcc(True)
+                    rig(f"run-end: LiPo at {v / n:.3f} V, harness on")
             samples.writerow(row)
         except OSError as e:  # the board is the other master on this bus
             errors += 1
@@ -250,4 +315,4 @@ def report():
 
 
 if __name__ == "__main__":
-    report() if sys.argv[1:] == ["report"] else run()
+    {"report": report, "zero": zero}.get("".join(sys.argv[1:]), run)()
