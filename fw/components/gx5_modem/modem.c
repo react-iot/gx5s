@@ -213,7 +213,12 @@ static bool bringup(void)
 #ifdef CONFIG_GX5_GNSS
     AT("AT+QGPS=1"); // errors if already running
 #endif
-    if (!at("AT+CPIN?", "+CPIN: READY", NULL, NULL, 5000)) return false;
+    // Right after AT+CFUN=1 the SIM is still starting: +CME ERROR: 14 (SIM busy). Ask again
+    // rather than fail the whole bring-up and wait out the 5 s back-off (soak 2026-11-22).
+    for (int i = 0; !at("AT+CPIN?", "+CPIN: READY", NULL, NULL, 5000); i++) {
+        if (i >= 20 || (s_stop && s_abortable)) return false; // ~4 s: no SIM
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
     AT("AT+CMGD=1,4"); // SMS is only a wake-up poke: drop it so storage never fills
 
     for (int i = 0;; i++) {
@@ -518,6 +523,7 @@ static void park(void)
     uart_flush_input(UART);
     // End the session first, also before the radio goes off: a link that just drops makes
     // the broker publish our will ("offline") over the status we sent last.
+    if (s_session) log_network(); // signal at the end too: just after registering it reads -125,0,8,0 (not measured yet)
     if (s_session) at("AT+QMTDISC=0", "+QMTDISC:", NULL, NULL, DISC_MS); // never connected: no URC comes, time wasted
     s_session = false;
     gnss_off();
