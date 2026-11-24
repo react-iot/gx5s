@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include "esp_event.h"
+#include "esp_log.h"
 #include "sdkconfig.h"
 
 // Pins. Where docs/gx5s-board-spec.md disagrees (SD CS/CLK), these are right (bench).
@@ -50,12 +51,20 @@ enum {
     GX5_EV_TIME,              // network time, data: int64_t UTC epoch
     GX5_EV_MOTION,            // driving event or calibration done, data: gx5_motion_t
     GX5_EV_EXT_RX,            // line from the external UART, data: char[]
+    GX5_EV_CAN_IGN,           // ignition as the vehicle profile's CAN rule sees it, data: bool
+    GX5_EV_VIN,               // the vehicle answered the VIN request, data: char[18]
 };
 
 typedef struct {
     int kind; // gx5_mot_ev_t (motion.h)
     int mg;   // peak acceleration of the event
 } gx5_motion_t;
+
+// Debug mode: {"debug":true} over MQTT or USB, kept in NVS. Adds the detail needed to
+// work out what a vehicle or the modem is doing: CAN frames, answers, ignition
+// decisions, supply samples, wake sources, every modem command.
+extern bool gx5_debug;
+#define GX5_DBG(tag, fmt, ...) do { if (gx5_debug) ESP_LOGI(tag, "dbg " fmt, ##__VA_ARGS__); } while (0)
 
 #define GX5_PUB_MAX 256 // largest payload the device publishes
 

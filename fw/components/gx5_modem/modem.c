@@ -99,17 +99,19 @@ static void urc(char *line)
     }
 }
 
-// GX5_MODEM_AT_LOG: every command and reply line. Lines with credentials (broker login,
+// GX5_MODEM_AT_LOG or debug mode: every command and reply line. Lines with credentials (broker login,
 // APN, a received MQTT message, which may be a provisioning message) lose their arguments.
 #ifdef CONFIG_GX5_MODEM_AT_LOG
+#define AT_LOG true
+#else
+#define AT_LOG false // only in debug mode
+#endif
 static void at_log(const char *dir, const char *s)
 {
+    if (!AT_LOG && !gx5_debug) return;
     bool secret = strstr(s, "QMTCONN") || strstr(s, "QICSGP") || strstr(s, "QMTRECV");
     ESP_LOGI(TAG, "%s %.*s%s", dir, secret ? (int)strcspn(s, "=:") : (int)strlen(s), s, secret ? " ..." : "");
 }
-#else
-#define at_log(dir, s)
-#endif
 
 // One line (CR/LF stripped, blanks skipped) or the bare '>' data prompt.
 static bool read_line(char *buf, size_t size, TickType_t deadline)

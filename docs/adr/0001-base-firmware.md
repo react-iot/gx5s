@@ -29,8 +29,8 @@ Status: accepted (2026-11-15)
    |---|---|---|---|---|
    | RUN | 80 MHz + auto light sleep | MQTT connected | ignition on | — |
    | LINGER | same | MQTT connected | ignition off / timer or RI wake | — |
-   | SLEEP | deep sleep | registered, `QSCLK=1`, GNSS off | linger or connect timeout expired | ignition (ext0), RI or motion (ext1), heartbeat timer |
-   | HIBERNATE | deep sleep | radio off (`CFUN=0`), `QSCLK=1`, GNSS off | as SLEEP, when `GX5_HIBERNATE=y` | ignition (ext0), motion (ext1), heartbeat timer |
+   | SLEEP | deep sleep | registered, `QSCLK=1`, GNSS off | linger or connect timeout expired | ignition wire or CAN traffic (ext0), RI or motion (ext1), heartbeat timer |
+   | HIBERNATE | deep sleep | radio off (`CFUN=0`), `QSCLK=1`, GNSS off | as SLEEP, when `GX5_HIBERNATE=y` | ignition wire or CAN traffic (ext0), motion (ext1), heartbeat timer |
    | PROTECT | deep sleep | radio off (`CFUN=0`), `QSCLK=1`, GNSS off | supply below cutoff | ignition (only if off), recheck timer |
 
    In all sleep states the regulator is in power-save mode, the charger is off and
@@ -115,13 +115,13 @@ Status: accepted (2026-11-15)
      retained status under the old location is not cleared. There is no site id in
      the topics: provisioning decides which broker a device belongs to.
    - Backend answers on `device/<id>` with one provisioning message:
-     `{"provision":{"pop":"<PIN>","broker":{"host","port","user","pass","tls"},"config":{"location":"0001","can":{..}}}}`.
+     `{"provision":{"pop":"<PIN>","broker":{"host","port","user","pass","tls"},"config":{"location":"0001","vehicle":{..}}}}`.
      `pop` is a proof-of-possession PIN in the style of ESP BLE provisioning: the last
      three bytes of the device id as one decimal number, 8 digits
      (`C4:DD:57:E0:9F:AF` -> `14720943`); it is also printed in the startup banner.
      A wrong or missing PIN, or a bare `{"broker":..}`, changes nothing and publishes
      `event` `provision-rejected`. `config` is applied first (today: `location` and
-     the `can` object), then the broker is tried at once and stored **only if the connection
+     one vehicle-profile message), then the broker is tried at once and stored **only if the connection
      succeeds**; otherwise the device returns to the broker it came from and
      publishes `event` `broker-change-failed`. Messages may be up to 511 bytes.
    - The same message on the production broker re-provisions.
@@ -200,29 +200,55 @@ Status: accepted (2026-11-15)
      telemetry, live and offline, so it can be up to one interval old. Stopped
      (`QGPSEND`) before SLEEP. The log shows operator, cell and signal
      (`AT+COPS?`, `AT+QNWINFO`, `AT+QCSQ`) on every bring-up.
-10. **CAN** (`gx5_can`, protocol logic in `gx5_proto/canproto.h`). Plain C with
-    fixed-size state (no heap).
-    - Runs only while ignition is on. The TWAI driver holds a no-light-sleep lock
-      while enabled, so RUN does not light-sleep with CAN on.
-    - Modes: `off`, `listen` (default; never drives the bus), `obd2`, `j1939`. The
-      active modes acknowledge and transmit on the vehicle bus.
-    - Configured over MQTT and kept in NVS (`gx5/can`): `{"can":{mode,bitrate,filter}}`
-      and `{"can_req":{slot,id,data,interval}}` — 16 request slots, each a raw frame
-      sent every `interval` seconds (OBD-II PID request or J1939 PGN request alike).
+10. **CAN and the vehicle profile** (`gx5_can`, protocol logic in
+    `gx5_proto/canproto.h`). Plain C with fixed-size state (no heap).
+    - Modes: `off`, `listen` (never drives the bus), `obd2`, `j1939`. The active modes
+      acknowledge and transmit on the vehicle bus. The TWAI driver holds a
+      no-light-sleep lock while enabled.
+    - **Profile** (NVS `gx5/veh`, about 2 kB; revised 2026-11-24 for OBD-II installs,
+      which have no ACC wire). Four messages, over MQTT or the USB console:
+      `{"vehicle":..}` name, bitrate, ignition rule; `{"pid":..}` a library of 32 raw
+      request frames; `{"sig":..}` 48 numbers decoded on the device from the answers,
+      with the field names of the OBDb signal sets (`bix`, `len`, `mul`, `div`, `add`,
+      `sign`, `blsb`) so a backend can convert those files mechanically;
+      `{"can":{"state":..}}` a mode and a list of (library entry, interval) per state.
+    - **Three states**: `pre` (awake, ignition not seen since the wake), `on`, `off`
+      (awake after ignition off). As shipped `on` listens and the other two keep the bus
+      off, which is the behaviour before the profile existed.
+    - **Ignition source**: `acc` the wire (default), `vcc` supply voltage with two
+      thresholds, `sig` a decoded signal (answered, or at least `min`), `frame` a byte
+      of a broadcast frame (GX5sV2's Kia rule: 0x541 byte 0 = 0x03). `sig` and `frame`
+      turn off when not seen for `hold_s`. This replaces the earlier decision to leave
+      CAN ignition out: it needs the device awake before ignition, so the window is
+      bounded (`pre_s`, then the normal connect and linger limits) and decision 6 still
+      cuts everything off on a low supply.
+    - **Wake on CAN traffic**, as GX5sV2 did it: the SN65HVD230 passes the bus through
+      in standby and CAN-RX (GPIO32) low wakes the chip on ext0. The ESP32's ext1 only
+      does "any high", so CAN-RX cannot join motion and RI there: a profile has either
+      the ACC wire or CAN traffic on ext0, chosen by the ignition source. Not armed when
+      the bus is busy at the moment of sleeping, nor after three CAN wakes in a row that
+      did not lead to ignition (until another wake cause); motion and the heartbeat remain.
+    - **VIN**: the profile names the library request that returns it (`vin_pid`). An
+      RTC-memory flag is lost with power, so at the first ignition on after a power
+      loss the request is sent every 10 s until answered; the VIN is kept in NVS
+      (`gx5/vin`) and reported with the previous one as an `event`.
+    - **Debug mode** (`{"debug":true}`, NVS `gx5/dbg`, `GX5_DBG()` in `gx5.h`): a
+      runtime switch rather than a build, because the vehicle is where it is needed.
+      Covers CAN traffic (one frame per id every 5 s), ignition decisions, supply
+      samples, wake sources and the modem command log.
     - OBD-II: ISO-TP single/first/consecutive frames with flow control, 16-bit PIDs
       for service 0x22, gateway addressing on 0x6xx ids, one request at a time
       (next after completion or 300 ms). Negative responses are dropped.
     - J1939: address claim as 0xF8 (at start and on request), TP.BAM and TP RTS/CTS
-      assembly with end-of-message ACK, optional "requested PGNs only" filter.
+      assembly with end-of-message ACK, optional "library PGNs only" filter.
     - Latest value per (ECU, service, PID) or (PGN, source); only changes are
-      published, to `device/<id>/<location>/can`, as text
+      published to `device/<id>/<location>/can`: decoded signals as
+      `{"sig":{"rpm":1726}}`, answers without a signal as text
       (`7E8 01 0C 1AF8`, `FEEE 00 8C7D..`) inside a JSON array. Limits: 40 values,
-      96 bytes each (longer responses truncated), 4 concurrent multi-frame messages.
-    - Deliberately left out: CAN-based ignition detection (BMW, Toyota, Kia, Ford,
-      Nissan, Hyundai, OBD run-time) and "CAN traffic delays sleep". Both need the
-      device awake with ignition off, which breaks decision 6. Ignition is the ACC wire.
-    - Not done yet: Tesla decoder, ALDL (GM serial), CANopen, raw capture of
-      broadcast frames in `obd2` mode.
+      128 bytes each (longer responses truncated), 4 concurrent multi-frame messages.
+    - Not done yet: voltage-rise wake (GX5sV2 used the ULP coprocessor), reading the
+      profile back, decoding broadcast frames, signals on gateway-addressed (0x6xx)
+      requests, Tesla decoder, ALDL (GM serial), CANopen.
 11. **Component layout** (`fw/components/`). One component per piece of hardware or
     concern, each with its own public header, `Kconfig` menu and declared dependencies.
 

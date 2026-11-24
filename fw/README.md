@@ -77,19 +77,69 @@ reports `{"ev":"ota","version":"…","result":"ok"}` (or the reason it failed) o
 The clock comes from the RTC at boot and is corrected from network time whenever the cell
 is up and from GPS time on every fix; all times are UTC.
 
+## Debug mode
+
+`{"debug":true}` (MQTT or USB; kept across reboots, `false` turns it off) adds `dbg`
+lines to the console: every modem command and reply, CAN frames sent, one received
+frame per CAN id every 5 s, completed answers, what is published on `can`, the
+ignition rule's decisions, supply and battery every 5 s, and which wake sources are
+armed before each sleep. Use it to work out what a vehicle's bus carries; leave it off
+otherwise, the console traffic costs power.
+
 ## CAN
 
-CAN is configured over the command topic and kept across reboots:
+CAN is set up as a **vehicle profile**, sent over the command topic (or the USB
+console, one JSON object per line) and kept across reboots. A profile has four parts,
+one message each:
 
 ```json
-{"can":{"mode":"obd2","bitrate":500000}}
-{"can_req":{"slot":0,"id":"7DF","data":"02010C","interval":10}}
-{"can":{"mode":"j1939","bitrate":250000,"filter":true}}
-{"can_req":{"slot":0,"id":"18EA00F8","data":"EEFE00","interval":30}}
+{"vehicle":{"name":"kia-cerato-2021","bitrate":500000,"pre_s":60,"ign":{"src":"sig","key":"rpm","min":1,"hold_s":10}}}
+{"pid":{"n":0,"id":"7E0","data":"02010C"}}
+{"pid":{"n":1,"id":"7C6","data":"0322B002"}}
+{"sig":{"n":0,"key":"rpm","pid":0,"bix":0,"len":16,"div":4}}
+{"sig":{"n":1,"key":"fuel_l","pid":1,"bix":32,"len":8,"div":2}}
+{"can":{"state":"pre","mode":"obd2","poll":[[0,2]]}}
+{"can":{"state":"on","mode":"obd2","poll":[[0,1],[1,60]]}}
+{"can":{"state":"off","mode":"off"}}
 ```
 
-Modes are `off`, `listen` (default, never transmits), `obd2` and `j1939`; the last two
-acknowledge and transmit on the vehicle bus. `interval` 0 clears a slot.
+- **`pid`** — the library: up to 32 requests the vehicle answers, as raw frames (an
+  OBD-II / UDS single-frame request, or a J1939 PGN request). No `id` clears entry `n`.
+- **`sig`** — up to 48 named numbers decoded on the device from the answer to library
+  entry `pid`. The fields are those of the [OBDb](https://github.com/OBDb) signal sets:
+  `len` bits at bit `bix` of the data after the PID, times `mul`, over `div`, plus `add`;
+  `sign` and `blsb` (little-endian bytes) as there. Decoded values are published as
+  `{"ts":..,"sig":{"rpm":1726}}`; answers without a signal stay raw text.
+- **`can`** — one of three states: `pre` (awake, ignition not seen yet), `on` (ignition
+  on), `off` (awake after ignition off). Each has a mode — `off`, `listen` (never
+  transmits), `obd2`, `j1939` (both acknowledge and transmit) — and a list of
+  `[library entry, seconds]` pairs (0.1 s steps). As shipped: `on` listens, `pre` and
+  `off` keep the bus off.
+- **`vehicle`** — name, bitrate, and where ignition comes from:
+  `"acc"` the ACC wire (default); `"vcc"` supply voltage (`on_mv`, `off_mv`, `hold_s`);
+  `"sig"` a decoded signal answered with at least `min` (no `min`: any answer);
+  `"frame"` a broadcast frame (`id`, byte `at`, `mask`, `eq`). `sig` and `frame` turn
+  off when the condition has not been seen for `hold_s`.
+
+The profile can also name the request that returns the VIN (`"vin_pid":2` in
+`vehicle`). After a power loss the device may be in another vehicle, so at the first
+ignition on it asks again, stores the answer and publishes
+`{"ev":"vin","vin":"..","was":"..","changed":true}` on `event`. It needs the `on`
+state to be in a mode that transmits.
+
+`{"profile":"clear"}` puts the whole profile back as shipped.
+
+Ready-made profiles are in `fw/profiles/`, one message per line, to send in order.
+`kia-cerato-2021.jsonl` (run time as ignition, speed, fuel, odometer, doors, locks,
+hazard switch, brake light, handbrake, VIN) is built from the
+[OBDb Kia Cerato](https://github.com/OBDb/Kia-Cerato) signal set and decodes OBDb's
+2021 test answers correctly, but has not been run in a car yet.
+
+With any source but the ACC wire the device also **wakes on CAN traffic** (as well as
+motion and the heartbeat) and waits `pre_s` for ignition. A bus that never goes quiet
+is not armed as a wake source, and after three CAN wakes in a row without ignition it
+is left alone until something else wakes the device. A `sig` rule only works if the
+`pre` state polls that request, which means transmitting before ignition is known.
 
 ## Factory reset
 
@@ -141,11 +191,11 @@ serves until Ctrl-C (`-v` prints every frame, `--quiet` stops the broadcasts);
 on and an active mode at the bus's 500 kbit/s:
 
 ```json
-{"can":{"mode":"obd2","bitrate":500000}}
-{"can_req":{"slot":0,"id":"7DF","data":"02010C","interval":10}}
-{"can":{"mode":"j1939","bitrate":500000}}
-{"can_req":{"slot":0,"id":"18EA00F8","data":"E5FE00","interval":30}}
-{"can_req":{"slot":1,"id":"18EA00F8","data":"E6FE00","interval":60}}
+{"pid":{"n":0,"id":"7DF","data":"02010C"}}
+{"can":{"state":"on","mode":"obd2","poll":[[0,10]]}}
+{"pid":{"n":1,"id":"18EA00F8","data":"E5FE00"}}
+{"pid":{"n":2,"id":"18EA00F8","data":"E6FE00"}}
+{"can":{"state":"on","mode":"j1939","poll":[[1,30],[2,60]]}}
 ```
 
 ```sh
