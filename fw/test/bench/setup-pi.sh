@@ -7,7 +7,7 @@ U=${SUDO_USER:?run with sudo}
 H=$(getent passwd "$U" | cut -d: -f6)
 
 apt-get update
-apt-get install -y git nodejs npm build-essential can-utils i2c-tools \
+apt-get install -y git nodejs npm build-essential can-utils i2c-tools mosquitto-clients \
     python3-serial python3-can python3-smbus2 python3-pytest
 
 # Hat wiring (schematic "rPI CAN Device Tester" rev 1.0):
@@ -94,6 +94,32 @@ RestartSec=10
 WantedBy=multi-user.target
 EOF
 
+# MQTT capture: every message the broker lets this login see, one line each (time,
+# topic, payload), appended to ~/mqtt-capture/messages.log for later analysis. The
+# login is ~/.config/reactiot/mqtt-monitor.env (MQTT_HOST, MQTT_PORT, MQTT_USER,
+# MQTT_PASS; keep it mode 600); the service does nothing until that file exists. The
+# capture can hold provisioning messages, which carry broker credentials: it is
+# written owner-only.
+cat >/etc/systemd/system/gx5s-mqtt-capture.service <<EOF
+[Unit]
+Description=GX5s MQTT capture (all device messages, for later analysis)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=$H/.config/reactiot/mqtt-monitor.env
+
+[Service]
+User=$U
+UMask=0077
+EnvironmentFile=$H/.config/reactiot/mqtt-monitor.env
+ExecStartPre=/bin/mkdir -p $H/mqtt-capture
+ExecStart=/bin/sh -c 'exec mosquitto_sub -h "\$\$MQTT_HOST" -p "\$\$MQTT_PORT" -u "\$\$MQTT_USER" -P "\$\$MQTT_PASS" -i bench-monitor -t "device/#" -t "discovery/#" -t "location/#" -F "%%I %%t %%p" >>$H/mqtt-capture/messages.log'
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
 systemctl daemon-reload
-systemctl enable can0.service esp32-workbench.service
+systemctl enable can0.service esp32-workbench.service gx5s-mqtt-capture.service
 echo "Done. Reboot, then check: ip -br link show can0; i2cdetect -y 1; curl localhost:4000/api/ports"
